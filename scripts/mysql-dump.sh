@@ -2,8 +2,8 @@
 
 set -e -u
 
-backup_s3_directory=favor-group-backup
-domain=favor-group.ru
+backup_s3_directory=hiik-backup
+domain=hiik.ru
 prod_db=$(echo ${domain} | tr '.' '_' | tr '-' '_')
 date="$(date +%Y-%m-%d)"
 time="$(date +%H-%M-%S)"

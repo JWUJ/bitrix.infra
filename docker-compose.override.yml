@@ -1,0 +1,34 @@
+version: '2'
+
+# Customizations for hiik.ru infrastructure
+# Automatically loaded by docker-compose along with docker-compose.yml
+
+services:
+  certbot:
+    environment:
+      - PROVIDER=${CERTBOT_PROVIDER:-none}
+      - EMAIL=${ADMIN_EMAIL:-admin@hiik.ru}
+      - DOMAIN=${MAIN_DOMAIN:-hiik.ru}
+
+  nginx:
+    environment:
+      - TZ=${TIMEZONE:-Asia/Vladivostok}
+
+  php:
+    environment:
+      - TZ=${TIMEZONE:-Asia/Vladivostok}
+    volumes:
+      - ./config/php/vladivostok-timezone:/etc/timezone:ro
+      - ./config/php/vladivostok-localtime:/etc/localtime:ro
+
+  php-cron:
+    environment:
+      - TZ=${TIMEZONE:-Asia/Vladivostok}
+    volumes:
+      - ./config/php/vladivostok-timezone:/etc/timezone:ro
+      - ./config/php/vladivostok-localtime:/etc/localtime:ro
+
+  mysql:
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-hiik_bitrix}
+      TZ: ${TIMEZONE:-Asia/Vladivostok}

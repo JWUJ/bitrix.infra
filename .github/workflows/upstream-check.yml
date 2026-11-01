@@ -1,0 +1,50 @@
+name: Upstream Sync Check
+
+on:
+  schedule:
+    # Run every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/paskal/bitrix.infra.git
+          git fetch upstream master
+
+      - name: Compare commits
+        id: compare
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "COMMITS<<EOF" >> $GITHUB_ENV
+            git log HEAD..upstream/master --oneline -n 30 >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          fi
+
+      - name: Summary
+        run: |
+          echo "## 🔄 Upstream Sync Status" >> $GITHUB_STEP_SUMMARY
+          echo "Comparing against **paskal/bitrix.infra:master**" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.compare.outputs.behind }}" -gt 0 ]; then
+            echo "⚠️ Found **${{ steps.compare.outputs.behind }}** new commit(s) in upstream:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            echo "$COMMITS" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Repository is fully up-to-date with upstream!" >> $GITHUB_STEP_SUMMARY
+          fi
