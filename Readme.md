@@ -1,8 +1,17 @@
-# Bitrix infrastructure as a code [![Build Status](https://github.com/paskal/bitrix.infra/workflows/build/badge.svg)](https://github.com/paskal/bitrix.infra/actions/workflows/ci-build.yml) [![PHP Build Status](https://github.com/paskal/bitrix.infra/workflows/build-php/badge.svg)](https://github.com/paskal/bitrix.infra/actions/workflows/ci-build-php.yml) [![Pull Status](https://github.com/paskal/bitrix.infra/workflows/pull/badge.svg)](https://github.com/paskal/bitrix.infra/actions/workflows/ci-pull.yml)
+# Bitrix infrastructure as a code [![Build Status](https://github.com/JWUJ/bitrix.infra/workflows/build/badge.svg)](https://github.com/JWUJ/bitrix.infra/actions/workflows/ci-build.yml) [![Upstream Sync Check](https://github.com/JWUJ/bitrix.infra/actions/workflows/upstream-check.yml/badge.svg)](https://github.com/JWUJ/bitrix.infra/actions/workflows/upstream-check.yml)
 
-This repository contains infrastructure code behind Bitrix-based [site](https://favor-group.ru) of my father's metal decking business operating in multiple cities.
+> **Fork Notice**: This repository is a fork of the original [paskal/bitrix.infra](https://github.com/paskal/bitrix.infra) created by Dmitry Verkhoturov, maintained under the terms of the MIT License and adapted for [hiik.ru](https://hiik.ru) site infrastructure.
 
-It's a Bitrix website completely enclosed within docker-compose to be as portable and maintainable as possible, and a set of scripts around its maintenance like dev site redeploy or production site backup.
+This repository contains the infrastructure code behind the Bitrix-based website [hiik.ru](https://hiik.ru).
+
+It's a Bitrix website completely enclosed within Docker Compose to be as portable and maintainable as possible, along with scripts for maintenance like development site redeployment, production backups, and upstream synchronization with [paskal/bitrix.infra](https://github.com/paskal/bitrix.infra).
+
+## Upstream Synchronization
+
+This project maintains close compatibility with the upstream repository `paskal/bitrix.infra`:
+- **Core Engine (`docker-compose.yml`)**: Kept aligned with upstream to receive updates for PHP, Nginx, MySQL, and Docker builds cleanly.
+- **Local Overrides (`docker-compose.override.yml` & `.env`)**: Project-specific domain (`hiik.ru`), database, and timezone (`Asia/Vladivostok`) settings are isolated in `docker-compose.override.yml`.
+- **Sync Tooling**: Run `.\scripts\upstream-sync.ps1` (or `./scripts/upstream-sync.sh`) to inspect new commits from upstream, or check the weekly automated GitHub Actions workflow.
 
 ## Is it fast?
 
@@ -232,7 +241,7 @@ sudo mkdir -p /web
 sudo chown $USER:$(id -g -n) /web
 sudo apt-get update >/dev/null
 sudo apt-get -y install git >/dev/null
-git clone https://github.com/paskal/bitrix.infra.git /web
+git clone https://github.com/JWUJ/bitrix.infra.git /web
 cd /web
 # backup restoration, it's safe to run it multiple times
 sudo ./scripts/disaster-recovery.sh
