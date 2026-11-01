@@ -1,0 +1,293 @@
+# AGENTS.md — Quick reference for AI agents
+
+This repository is a generic Docker Compose stack for running a Bitrix CMS site.
+Production identity (TLS, site vhosts, site-specific cron) attaches via a
+private `docker-compose.override.yml` (see "Production overlay" in Readme.md).
+
+## Local demo quickstart (6 commands)
+
+```bash
+git clone https://github.com/paskal/bitrix.infra.git && cd bitrix.infra
+for f in private/environment/*.env.example; do cp "$f" "${f%.example}"; done
+cp config/zabbix/mysql-session.conf.example private/environment/zabbix-mysql-session.conf
+sudo ./scripts/fix-rights.sh
+docker compose up -d
+curl -L https://www.1c-bitrix.ru/download/start_encode.tar.gz | tar -xz -C web/prod/
+open http://localhost   # or xdg-open on Linux
+```
+
+In the Bitrix wizard: DB host = `localhost`, DB name / user / password from `private/environment/mysql.env`.
+
+## Residual gotchas
+
+| Gotcha | Fix |
+|--------|-----|
+| Port 80/443 in use | Set `HTTP_PORT=8080` / `HTTPS_PORT=8443` in `.env` |
+| Running two stacks side by side | Set a unique `COMPOSE_PROJECT_NAME` in each stack's `.env` |
+| Bitrix HTTP wizard rejects sessions (Firefox/curl) | `session.cookie_secure = Off` via a gitignored local override (see "Local overrides" in Readme.md) — do not edit the tracked ini |
+| 502s + php-fpm SIGSEGV after install on arm64 | PHP 8.4 opcache JIT crash — `opcache.jit = disable` in the same local override |
+| `fix-rights.sh` without sudo | Creates the required directories and skips ownership fixes (sufficient on macOS Docker Desktop); the chowns matter on Linux hosts — use sudo there |
+| Adding TLS | Provide a dhparam file ≥2048 bits (`openssl dhparam -out private/letsencrypt/dhparams.pem 2048`) and declare `ssl_dhparam` per vhost in the private overlay |
+| macOS bind-mount changes invisible | Docker Desktop bind mounts sometimes need `docker compose restart` → force-recreate to pick up inode changes |
+| File-level mounts track inodes | Deploy config changes with `tee` (write in-place) rather than `rsync`/`git pull`; see Readme.md nginx deploy notes |
+| `my.cnf` is sized for a dedicated server | `innodb_buffer_pool_size = 4G`, so the host needs at least 8 GB of RAM (on 4 GB the kernel kills mysqld during initialisation and the container restarts in a loop); shrink via a gitignored compose override mounting your own cnf (see "Local overrides" in Readme.md) — keeps the tree clean |
+| Optional services missing | `adminer`, `updater`, `certbot`, `zabbix-agent`, `ftp` sit behind compose profiles — enable with `COMPOSE_PROFILES` when needed; the core stack needs none |
+
+## Automating the Bitrix installer
+
+The install wizard predates modern web conventions; if you drive it programmatically:
+
+- State is 100% session-based with no URL checkpointing — keep one `curl` cookie jar for the whole flow; losing the session restarts from step 1. Browser automation is fragile here (any tab navigation kills it); `curl` is the reliable path.
+- **CWizard keeps no server-side state between requests**: `CWizard::GetVar()` reads `$_REQUEST` directly, so every request must carry ALL the hidden `__wiz_*` fields scraped from the current step's page. Omitting them yields plausible-looking success responses while the service scripts silently no-op.
+- The real protocol is a hidden-iframe **form POST** (`application/x-www-form-urlencoded`); replicate the module-installation AJAX loop as `POST` with `CurrentStepID=create_modules&__wiz_nextStep=X&__wiz_nextStepStage=Y` plus all hidden fields. Each response contains `[response]...Post(...)[/response]` with the next step/stage — loop until it stops advancing (~38 iterations for the Start edition). (`GET` happens to work too when every field is in the query string, since CWizard reads `$_REQUEST`.)
+- The main installer is followed by a SECOND wizard (the solution/content wizard): `select_template → select_theme → site_settings → data_install → finish`. Do not jump straight to `CurrentStepID=finish` — that skips `data_install`, `_index.php` is never created and the site stays stuck on the wizard runner. Its `data_install` AJAX responses use positional `Post(step, stage)` arguments (not the named-object form of the first wizard), and the theme field is named `__wiz_<solution>_themeID`.
+- The licence step embeds an iframe from `www.1c-bitrix.ru` that may issue a top-frame JS redirect in real browsers; curl is immune.
+- One installer redirect drops a non-standard port from the URL — re-request `http://localhost:${HTTP_PORT}/` (avoid `curl -L`, it follows to port 80) and the wizard continues.
+- Selecting the blank `@` template requires a Bitrix cloud licence; the bundled demo solutions install from local files without one.
+- Admin login via curl returns `setAuthResult(false)` even with correct credentials — verify the installed site's admin via a real browser.
+- After editing Bitrix tables directly via SQL, delete the matching `bitrix/managed_cache/MYSQL/<dir>` inside the php container or the old value keeps being served.
+
+## Verify
+
+```bash
+# nginx config test
+mkdir -p /tmp/empty
+docker run --rm --add-host php:127.0.0.1 \
+  -v "$PWD/config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" \
+  -v "$PWD/config/nginx/bitrix.conf:/etc/nginx/bitrix.conf:ro" \
+  -v "$PWD/config/nginx/fastcgi.conf:/etc/nginx/fastcgi.conf:ro" \
+  -v "$PWD/config/nginx/bots.conf:/etc/nginx/bots.conf:ro" \
+  -v "$PWD/config/nginx/security_headers.conf:/etc/nginx/security_headers.conf:ro" \
+  -v "$PWD/config/nginx/static-cdn.conf:/etc/nginx/static-cdn.conf:ro" \
+  -v "$PWD/config/nginx/conf.d:/etc/nginx/conf.d:ro" \
+  -v /tmp/empty:/etc/nginx/private.conf.d:ro \
+  -v /tmp/empty:/etc/nginx/letsencrypt:ro \
+  ghcr.io/paskal/nginx:latest nginx -t
+
+# compose validation
+COMPOSE_PROFILES=certs,dbadmin,monitoring,hooks,ftp-manual docker compose config -q
+```
+
+## Operating notes for the production deployment
+
+The sections below are the maintainer's notes for operating the stack on the production host; the quickstart above is all a local demo needs.
+
+## Build/Service Commands
+- Start services: `docker-compose up --build -d`
+- Stop services: `docker-compose down`
+- Rebuild containers: `docker-compose build --no-cache`
+- Fix permissions: `sudo ./scripts/fix-rights.sh`
+- Clear cache: `echo "flush_all" | docker exec -i memcached /usr/bin/nc 127.0.0.1 11211`
+- Clear sessions: `echo "flush_all" | docker exec -i memcached-sessions /usr/bin/nc 127.0.0.1 11211`
+
+## Code Style Guidelines
+- Bash: Follow POSIX compatibility where possible
+- PHP: PSR-12 standard with 4-space indentation
+- YAML: 2-space indentation
+- HTML/CSS: 2-space indentation
+- Docker: Follow best practices for multi-stage builds and minimal images
+- Error handling: Log all errors with appropriate context
+- Backup scripts: Always test restore process after implementation
+- Config files: Use comments to document non-obvious settings
+
+## File Structure Conventions
+- Config files in `/config` directory
+- Scripts in `/scripts` directory
+- Logs in `/logs` directory
+- Web files in `/web/prod` and `/web/dev`
+- Environment files in `/private/environment`
+
+## Server
+- Production server: `bitrix` (SSH alias)
+- Repository location on server: `/web`
+- Host timezone: UTC, php-cron container timezone: Europe/Moscow (UTC+3)
+- File timestamps on server are in UTC
+
+## Nginx Config Deployment
+- **CRITICAL: NEVER `docker compose restart nginx` without testing config first.** A broken config prevents nginx from starting, causing full site outage. Always:
+  1. `docker exec $(docker ps -qf "name=nginx" | head -1) nginx -t`
+  2. Only if test passes → `docker compose restart nginx` or `docker exec nginx nginx -s reload`
+- File-level Docker bind mounts track inodes; **anything that replaces the file — `rsync`, `git pull`, `git checkout`, `git stash` — swaps the inode and the running container keeps reading the OLD content.** `nginx -t`/`-s reload` then operate on the stale inode and silently confirm the old config (verify with `docker exec nginx grep <new-marker> /etc/nginx/file.conf` — not just `nginx -t`).
+- Deploy via `tee` to write in-place: `ssh bitrix 'tee /web/config/nginx/file.conf' < config/nginx/file.conf > /dev/null`
+- Always test before reload: `docker exec nginx nginx -t && docker exec nginx nginx -s reload`
+- **If the inode was already swapped (e.g. you deployed via `git pull`), reload is not enough — re-bind with `docker restart nginx`** (plain docker; it re-resolves bind mounts from the stored host path on start). Validate the new file first WITHOUT touching the live container via an ephemeral run on the compose network: `docker run --rm --entrypoint nginx --network web_default -v /web/config/nginx/<each>.conf:/etc/nginx/<each>.conf:ro -v /web/private/nginx:/etc/nginx/private.conf.d:ro -v /web/private/letsencrypt:/etc/nginx/letsencrypt:ro ghcr.io/paskal/nginx:latest -t`
+- **`docker compose` needs the regular production profiles enabled or it errors `nginx depends on undefined service`.** Regular optional services sit behind profiles (`certs`, `monitoring`, `hooks`); the private overlay makes `nginx` `depends_on` `updater` (profile `hooks`), so any bare `docker compose <cmd> nginx` fails to resolve the dependency. Always prefix with `COMPOSE_PROFILES=certs,monitoring,hooks` (the shell default on the server and `/web/.env` carry the same list). E.g. recreate: `cd /web && COMPOSE_PROFILES=certs,monitoring,hooks docker compose up -d --force-recreate --no-deps nginx`. **Adminer is retired since 31.10.2026**: `dbadmin` is off everywhere, the overlay's adminer vhost answers 403 and MySQL `root@'%'` no longer exists, so do not add `dbadmin` back. FTP is deliberately isolated under `ftp-manual` and must never be added to the shell default.
+- Directory-level mounts (e.g. `conf.d/`) don't have the inode issue
+- `nginx -V` output from a running container may not match the image used on restart — don't trust module availability without testing in a fresh container
+
+## Cron File Deployment
+- `/web/config/cron` and `/web/config/logrotate` are root-owned. Production public pulls must run through `scripts/pull-public.sh`, never a plain `git pull`. The wrapper gives `admin` temporary ownership of only those two directories and restores both directories and their files to `root:root`, mode `0644`, through an exit and signal trap.
+- The wrapper restarts `php-cron` only when the file-mounted `config/cron/php-cron.cron` inode changes, then verifies the host and container inodes. Host cron and logrotate use symlinks to repository paths and need no service restart.
+- Public nginx changes are tested before activation. Directory-mounted `conf.d` changes receive an `nginx -t` and reload. A changed file-level bind is first tested in a fresh container using the new host files, then nginx is restarted to rebind those inodes.
+- Private overlay pulls continue through `/web/private/scripts/pull-private.sh`; do not replace either wrapper with a plain pull in `updater.yaml`.
+- **`private/cron/site.cron` is a file-level mount into php-cron (`/etc/cron.d/site-tasks`)**, so `git pull` swaps the inode and the container keeps reading the OLD file — `docker restart php-cron` after the pull to re-bind (verify with `docker exec php-cron stat -c %i /etc/cron.d/site-tasks` vs the host file). Host symlinks like `bitrix_infra` / `bitrix_site` and directory mounts don't have this issue.
+
+## Private overlay
+
+Production identity (TLS certs, site vhosts, site-specific cron jobs, CSP snippets, Yandex Metrika maps, my.cnf overrides, container_name pins) lives in a **separate private repo** — `bitrix.infra-private` — checked out on the server.  A `docker-compose.override.yml` in that private repo is symlinked next to `docker-compose.yml` on the server so Compose merges them automatically.  The public repo boots a localhost demo on a fresh clone; prod re-attaches its identity via the overlay.
+
+- Private overlay nginx site vhosts: `private/nginx/sites/*.conf` (glob included by `nginx.conf`)
+- Private overlay cron: second `/etc/cron.d` entry mounted by the override
+- Container names: not in the public compose; overlay adds `container_name:` to pin prod names
+- `config/updater.yaml`: public file has a generic example; overlay remaps the volume to the private tasks file
+
+## Zabbix: disabled stock triggers
+
+The stock template «MySQL by Zabbix agent 2 active» is not managed in git. Its triggers «Number of internal temporary tables created per second is high» (21204) and «Number of temporary files created per second is high» (21203) are disabled since 03.10.2026: they fired 14 and 7 times in September and no action ever followed (Dmitry: «useless»). The on-disk temporary tables trigger stays on. Re-importing or upgrading that template re-enables both; disable them again afterwards (`trigger.update` with `status: 1`).
+
+## PHPStan Monitoring
+
+Weekly PHPStan scan against the prod Bitrix tree; count of owned-code findings is read by zabbix-agent via `system.run`, trigger alerts when count ≠ 0.
+
+**File locations:**
+- `scripts/phpstan-scan.sh` — entrypoint (flock-guarded, self-updates PHAR)
+- `private/phpstan/phpstan-owned.neon` — alerted scope (target = 0); lives in private repo; copy from `phpstan-owned.neon.example` as a starting point
+- `private/phpstan/phpstan-owned.neon.example` — generic public template
+- `private/phpstan/phpstan-diagnostic.neon` — manual broader sweep; lives in private repo
+- `private/phpstan/phpstan.phar` — auto-updated PHAR (gitignored)
+- `config/zabbix/templates/phpstan-monitoring.yaml` — template (three items, three triggers — count + freshness + failure-marker)
+- `logs/phpstan/owned-latest.json` + `owned_errors_count.txt` — output, also kept for `diagnostic-*`
+- `logs/phpstan/stderr.log` — open_basedir noise + any real PHP warnings
+- Cron line in `config/cron/host.cron`: `30 4 * * 1 root cd $INFRA_DIR && ./scripts/phpstan-scan.sh >>/web/logs/phpstan/cron.log 2>&1` (script's diagnostic prints preserved for forensics)
+
+**Manual scans:**
+```bash
+# Owned scope (what Zabbix watches) — ~2 min cold, ~1 min warm
+ssh favor-group 'cd /web && ./scripts/phpstan-scan.sh'
+
+# Diagnostic scope (broader, manual-only) — ~5 min cold
+ssh favor-group 'cd /web && ./scripts/phpstan-scan.sh --diagnostic'
+
+# Read result
+ssh favor-group 'cat /web/logs/phpstan/owned_errors_count.txt'
+```
+
+**When to use diagnostic scope:** the owned count jumped and the obvious recent commit doesn't explain it. Run diagnostic, diff the file lists against `owned-latest.json`, see if a path change accidentally scoped in vendor code (the answer is usually yes — fix via `excludePaths` in the owned neon).
+
+**Re-import the Zabbix template after edits:**
+```python
+from zabbix_utils import ZabbixAPI
+import os
+api = ZabbixAPI(url=os.environ['ZABBIX_URL'])
+api.login(token=os.environ['ZABBIX_TOKEN'])
+with open('config/zabbix/templates/phpstan-monitoring.yaml') as f:
+    api.configuration.import_(
+        source=f.read(), format='yaml',
+        rules={
+            'templates':       {'createMissing': True, 'updateExisting': True},
+            'items':           {'createMissing': True, 'updateExisting': True},
+            'triggers':        {'createMissing': True, 'updateExisting': True},
+            'template_groups': {'createMissing': True},
+        },
+    )
+```
+Zabbix canonicalises the YAML on export (strips `value_type: UNSIGNED` since that's the default, normalises block-scalar whitespace). The committed file is the canonical export form — diffs after edits should be small and stable.
+
+**Linking the template to a host** (`host.update` REPLACES the templates list, so preserve existing first):
+```python
+h = api.host.get(hostids='<HOSTID>', selectParentTemplates=['templateid'], output=['hostid'])[0]
+existing = [{'templateid': t['templateid']} for t in h['parentTemplates']]
+api.host.update(hostid='<HOSTID>', templates=existing + [{'templateid': '<TEMPLATEID>'}])
+```
+On favor-group: template 10655 linked to host 10350 (`favor-group.ru_yandex.cloud.host`).
+
+After linking, the agent picks up the new active-check list on its next config refresh. Force it immediately with `docker compose restart zabbix-agent` (or `docker compose --profile monitoring restart zabbix-agent` if started under that profile) — otherwise the first item value lands ~5 minutes later via the agent's automatic refresh.
+
+**Triggers in the template:**
+- `system.run[... owned_errors_count.txt]<>0` — fires when owned-error count drifts above zero (severity WARNING).
+- `fuzzytime(... vfs.file.time[owned-latest.xml,modify], 8d)=0` — long-tail backstop. Fires when the XML file hasn't been rewritten in 8 days. We watch the XML mtime rather than count.txt because the XML is only ever written when PHPStan actually completed a scan; the count file could in principle be touched manually and silently re-arm freshness. One-day grace over the 7-day cron interval. Severity WARNING.
+- `last(... vfs.file.exists[owned_last_failure.txt])=1` — fast-path. Fires within ~5 min (one polling cycle) when the scan script writes a failure sentinel (empty/truncated XML, PHPStan exit ≠ 0|1, simplexml parse failure, post-processing failure). The sentinel is auto-cleared on the next successful run. Severity HIGH.
+
+All three ship `status: ENABLED` in the YAML — re-imports stay armed without an extra step. Trade-off: a fresh install must stabilise (run the scan once → count=0 → XML file fresh) *before* linking the template to a host, otherwise the count and freshness triggers fire on first poll. See Readme.md "How to enable" step 5 for the linking order.
+
+**PHAR auto-update note:** no version pin. `curl -sLz` does a conditional GET; zero traffic when unchanged. Acceptable because the metric is *zero owned errors* — a new PHPStan release that adds a rule simply produces fixable findings on the next run, not a baseline-drift false alarm.
+
+**Historical scans:** previous runs aren't archived (only `*-latest.json` is kept). For trend data, look at the Zabbix item history (retention 30 d by default in the shipped template).
+
+**Full design rationale** (D1–D7, all task post-mortems, ignoreErrors taxonomy, synthetic-regression test transcript): `favor-group.ru/docs/plans/completed/20260517-phpstan-prod-monitoring.md`.
+
+## Disk-space alerts: hysteresis lives in the stock Linux template
+
+The free-space triggers flapped because they fired above the threshold and recovered the moment the
+value dipped back under it, so a filesystem sitting on the line alerted several times a day. Both
+space triggers now have a recovery expression five points below the firing threshold: the problem
+opens above X and closes only below X-5.
+
+Applied to the trigger prototypes in **`Linux by Zabbix agent active`** (templateid 10284), which is
+the lowest level available here: it has no parent and no nested templates, and all four monitored
+hosts link to it, so every discovered filesystem inherits the change.
+
+| Prototype | Problem | Recovery |
+|---|---|---|
+| `Linux: FS [{#FSNAME}]: Space is low` (17810) | `min(…pused,5m) > {$VFS.FS.PUSED.MAX.WARN:"{#FSNAME}"}` | `max(…pused,5m) < {$VFS.FS.PUSED.MAX.WARN:"{#FSNAME}"}-5` |
+| `Linux: FS [{#FSNAME}]: Space is critically low` (17809) | `min(…pused,5m) > {$VFS.FS.PUSED.MAX.CRIT:"{#FSNAME}"}` | `max(…pused,5m) < {$VFS.FS.PUSED.MAX.CRIT:"{#FSNAME}"}-5` |
+
+Thresholds stay per host through the existing macros, and the arithmetic resolves after macro
+substitution, so a host at 95 recovers at 90 without any extra macro.
+
+🚨 **This is a stock Zabbix template, so an upgrade or a re-import of it silently reverts the
+recovery expressions and the flapping returns.** Re-apply after every Zabbix upgrade and after any
+re-import of the Linux template, then confirm the prototypes report `recovery_mode: 1`:
+
+```python
+import os
+from zabbix_utils import ZabbixAPI
+api = ZabbixAPI(url=os.environ['ZABBIX_URL']); api.login(token=os.environ['ZABBIX_TOKEN'])
+T, KEY = 'Linux by Zabbix agent active', 'vfs.fs.dependent.size[{#FSNAME},pused]'
+for tid, macro in (('17810', '{$VFS.FS.PUSED.MAX.WARN:"{#FSNAME}"}'),
+                   ('17809', '{$VFS.FS.PUSED.MAX.CRIT:"{#FSNAME}"}')):
+    api.triggerprototype.update(triggerid=tid, recovery_mode=1,
+        expression=f'min(/{T}/{KEY},5m)>{macro}',
+        recovery_expression=f'max(/{T}/{KEY},5m)<{macro}-5')
+```
+
+Prototype ids are stable across edits but not across a template re-import, so look them up by name
+if the update fails. Filesystems already discovered keep the old behaviour until the next run of
+`Mounted filesystem discovery`, which is dependent on the active-agent item `vfs.fs.get` and
+therefore cannot be forced with «Execute now»; on 11.09.2026 the two live triggers picked up the
+recovery expression 35 minutes after the prototypes changed.
+
+The inode triggers (17811, 17812) still have no hysteresis; the same pattern applies with the
+comparison reversed, recovery at `> {$VFS.FS.INODE.PFREE.MIN.*}+5`.
+
+## Zabbix server port 10051 is allow-listed (31.10.2026)
+
+The Zabbix server runs in Docker on terrty and publishes 10051 with `-p`, which bypasses firewalld
+(DNAT'ed traffic is accepted in FORWARD before the zone rules apply). The port is therefore closed
+in the `DOCKER-USER` chain through firewalld direct rules: a `RETURN` per known agent address, then
+a `DROP` for the rest of `tcp dport 10051` on the public interface; 10051/tcp was also removed from
+the public zone so the IPv6 docker-proxy path is closed. **A new active agent or `zabbix_sender`
+host gets no data through until its public IP is added**, so do that first:
+
+```sh
+ssh terrty 'for m in "" --permanent; do sudo firewall-cmd $m --direct --add-rule ipv4 filter DOCKER-USER 0 -i enp0s6 -p tcp --dport 10051 -s <agent-ip> -j RETURN; done; sudo iptables -S DOCKER-USER'
+```
+
+Current list: `ssh terrty sudo firewall-cmd --permanent --direct --get-all-rules`. The rule order
+matters: priority 0 for the allows, the drop sits at priority 1.
+
+## Zabbix: disabled stock triggers and tuned thresholds (03.10.2026)
+
+Decided by Dmitry after the September alert review (141 problems, about 15 real). Several of these live only in the Zabbix database, not in git, so a template re-import or upgrade silently undoes them; re-apply and read back after any of those.
+
+| What | Where it lives | State |
+|---|---|---|
+| `MySQL: Number of internal temporary tables created per second is high` (template trigger 21204, host 17757) and `MySQL: Number of temporary files created per second is high` (21203, host 17554) | template `MySQL by Zabbix agent 2 active` (id 10635), **database only** | `status` 1 (disabled). The on-disk temp-tables trigger (21202) stays on: September maximum 0.08 per second against a threshold of 60. |
+| `FS [.../mysql-local.conf]: Space is low / critically low` (21840, 21842), the /web volume | two host macros on `favor-group.ru_yandex.cloud.host` (10350), **database only**: `{$VFS.FS.PUSED.MAX.WARN:"/etc/zabbix/zabbix_agent2.d/plugins.d/mysql-local.conf"}` = 85 and `...MAX.CRIT:...` = 92 | 5-minute window kept, recovery 5 points lower (80 and 87). The nightly backup (01:05 UTC) lifts the volume about 12 points for minutes, so 90 fired on any day with a baseline above 78. |
+| `tg-spam site is down` (21526) | host `tg-spam.exe.xyz`, **database only** | fires after 5 failed checks in a row (`#5`, 15 minutes) instead of 2; `tg-spam homepage is slow` (21528) disabled |
+| `Silent 5xx responses on user-facing pages` (21551) | template `Favor-group docker host monitoring` (10353), **database only**; `bitrix.infra-private` `zabbix/templates/favor-group-technical-monitoring.yaml` describes a different, unlinked template (10370), so importing it does not change the live trigger | fires when one 6-minute window holds 10 or more 5xx lines, kept 30 minutes (`max(count,30m)>=10`). New numeric item `... , count`; it reports 0 between 03:25 and 03:50 UTC every day so the scheduled kernel reboot (nginx answers 502 for about ten seconds) does not alert. Edit the live trigger through the API. |
+| `lead enrichment failed on terrty` (22038 template, 22039 on Zabbix server) | `config/zabbix/templates/favor-group-tg-agent-monitoring.yaml` | exit codes 1 and 2 (codex logged out, usage limit) alert at once; exit 3 (B24 REST timeout) only when two runs in a row end with 3 |
+| `SMART: [{#NAME}]: Average disk temperature is too high` and `... is critical` (trigger prototypes 19461, 19460, and the discovered triggers on host 10350) | template `SMART by Zabbix agent 2 active` (10537), **database only** | `status` 1 (disabled) since 16.10.2026: Dmitry does not want temperature alerts. An NVMe that overheats still sets its critical warning flag, which fires `Check returned "DISK FAILING"`. |
+| Maintenance `Nightly auto-restart window` (id 6) | hosts `favor-group.ru_yandex.cloud.host` (10350) and `Zabbix server` (10084), **database only** | daily 03:20–03:55 UTC with data collection, covering the 03:25 unattended-upgrades run (Docker and MySQL restarts) and the 03:40 automatic reboot. A problem that clears inside the window is never sent; one still open at 03:55 is sent then, because every action pauses operations for suppressed problems. Verified 31.10.2026 by injecting a problem into a test maintenance: suppressed with no alert, sent within 30 s of the maintenance ending. |
+
+Not changed on purpose: `404 hits found on URLs with utm_*` (18259) stays in Telegram, it caught a real loss of paid clicks (SPb sitelink, 08.09.2026). Backtests and the per-trigger table: `~/Downloads/favor-group.ru/redesign/auto-run/zabbix-review/`.
+
+## SEO Reindex Cron
+- `scripts/seo-reindex.sh` (daily 21:15 UTC = 00:15 MSK as `admin`) drains URLs from `/web/private/seo-reindex/queue.txt` into Yandex Webmaster recrawl, up to ~960/day account-wide quota. Token: `/web/private/environment/seo-reindex.env`. Logs: `/web/logs/seo-reindex/YYYY-MM-DD.log`. Bing is sent manually via `bin/search-reindex submit --bing-only <file>`.
+
+## Export Profiles (acrit.export)
+- Run single export: `docker exec -u www-data php-cron bash -c "/usr/bin/php -f /web/prod/bitrix/modules/acrit.export/cli/export.php profile=ID auto=Y site=s1 >> /web/prod/upload/acrit.export/log/log_ID.e63f31938c399df95752fe5013735c65.txt 2>&1"`
+- Must run as `www-data`, not root (root is rejected by the script)
+- `auto=Y` may skip export if data unchanged; killing a running export can leave a lock in the DB (visible as "Profile N is locked" in log), unlock via Bitrix admin
+- Logs: `/web/prod/upload/acrit.export/log/`
+- XML output: `/web/prod/upload/acrit.export/`

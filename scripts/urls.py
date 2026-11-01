@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+import sys
 from argparse import ArgumentParser
 from enum import Enum
 from typing import Optional
@@ -7,8 +9,8 @@ from lxml.html import fromstring
 
 import requests
 
-_redirects_map_path = '../config/nginx/conf.d/redirects-map.conf'
-_default_site = 'https://favor-group.ru'
+# the redirect map lives in the private overlay; override via REDIRECTS_MAP env
+_redirects_map_path = os.environ.get('REDIRECTS_MAP', '../private/nginx/sites/redirects-map.conf')
 
 
 class RunTypes(Enum):
@@ -83,36 +85,38 @@ class UrlChecker:
 
 def main(run_type: str, site: str, urls_file: str, update_redirects: bool):
     url_checker = UrlChecker(update_redirects)
-    for line in open(urls_file, 'r').readlines():
-        # skip empty lines and comments
-        if not line.strip() or line.strip().startswith("#"):
-            continue
-        absolute_url = line.strip()
-        # convert relative URLs to absolute
-        if not absolute_url.startswith("https://"):
-            absolute_url = urljoin(site, absolute_url)
-        resp = url_checker.retrieve_url(absolute_url)
-        if resp is None:
-            continue
-        if run_type == "titles":
-            title = fromstring(resp.content).findtext('.//title')
-            url = resp.url.removeprefix("https://favor-group.ru")
-            print(f"{url};{title}")
-        if run_type == "redirects":
-            url_checker.check_redirect(resp, absolute_url)
-        if run_type == "chain_redirects":
-            url_checker.chain_redirects(resp, absolute_url)
-        if run_type == "bad_status_codes":
-            url_checker.bad_status_codes(resp, absolute_url)
+    with open(urls_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            # skip empty lines and comments
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            absolute_url = line.strip()
+            # convert relative URLs to absolute
+            if not absolute_url.startswith("https://"):
+                absolute_url = urljoin(site, absolute_url)
+            resp = url_checker.retrieve_url(absolute_url)
+            if resp is None:
+                continue
+            if run_type == "titles":
+                title = fromstring(resp.content).findtext('.//title')
+                url = resp.url.removeprefix(site.rstrip('/'))
+                print(f"{url};{title}")
+            if run_type == "redirects":
+                url_checker.check_redirect(resp, absolute_url)
+            if run_type == "chain_redirects":
+                url_checker.chain_redirects(resp, absolute_url)
+            if run_type == "bad_status_codes":
+                url_checker.bad_status_codes(resp, absolute_url)
 
 
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--site',
                         dest="site",
-                        default=_default_site,
+                        default=None,
                         type=str,
-                        help='Site URL, needed only if relative links are provided')
+                        help='Site URL, needed only if relative links are provided '
+                             '(also reads SITE_URL env var)')
     parser.add_argument('--file',
                         dest="urls_file",
                         default="urls.txt",
@@ -131,5 +135,10 @@ if __name__ == '__main__':
              " or only pages which are not redirects with wrong status codes."
     )
     opts = parser.parse_args()
-    main(str(opts.run_type), opts.site, opts.urls_file, opts.update_redirects)
+    site = opts.site or os.environ.get('SITE_URL')
+    if site is None:
+        print('ERROR: --site or SITE_URL env var is required', file=sys.stderr)
+        parser.print_usage(sys.stderr)
+        sys.exit(1)
+    main(str(opts.run_type), site, opts.urls_file, opts.update_redirects)
 

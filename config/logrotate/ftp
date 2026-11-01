@@ -1,0 +1,14 @@
+/web/logs/ftp/pureftpd.log
+/web/logs/ftp/session-history.log
+{
+	daily
+	rotate 365
+	dateext
+	dateformat .%Y-%m-%d
+	missingok
+	notifempty
+	compress
+	delaycompress
+	copytruncate
+	su root root
+}

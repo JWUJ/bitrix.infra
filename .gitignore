@@ -22,11 +22,44 @@
 # web files folder
 /web
 
-# private folder
-/private
+# private folder is a SEPARATE repo (bitrix.infra-private) checked out at /private.
+# Hard-exclude the whole dir so its contents (and its own .gitignore !-rules) can
+# never show as untracked or be accidentally committed here. Already-tracked
+# *.env.example / phpstan templates stay tracked (gitignore does not untrack).
+/private/
 
 # default directory in linux mount
 /lost+found/
 
 # backups
 .synosnap_data/
+
+# beads are not public
+.beads
+
+# keys and certs (defence-in-depth, no known leaks)
+*.pem
+*.key
+*_rsa
+*_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.p12
+*.pfx
+
+# credentials-ish
+.env
+.htpasswd
+.netrc
+
+# OS noise
+.DS_Store
+
+# prod symlinks docker-compose.override.yml from the private overlay
+/docker-compose.override.yml
+
+# python bytecode
+__pycache__/
+
+# marker written by scripts/disaster-recovery.sh after the file restore
+/.dr-file-restore-done

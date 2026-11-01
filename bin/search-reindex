@@ -1,0 +1,884 @@
+#!/bin/sh
+# Search Engine URL Reindexing Tool (Yandex + Bing)
+#
+# Usage:
+#   search-reindex setup                - Interactive setup (OAuth, select domains, Bing API)
+#   search-reindex list                 - List all verified Yandex hosts
+#   search-reindex submit [--bing-only] <file>        - Submit absolute URLs from file
+#   search-reindex submit-url [--bing-only] <url>...  - Submit one or more absolute URLs
+#   search-reindex submit-regions [--bing-only] <file|-> - Submit relative URLs for all regions
+#   search-reindex diagnostics           - Check Yandex site issues (exit 1 if errors)
+#
+# Pass --bing-only to skip Yandex submission (useful when Yandex quota is exhausted).
+#
+# Examples:
+#   search-reindex submit-url https://example.com/page/
+#   search-reindex submit-regions urls.txt  # file contains /catalog/section/
+#   echo "/" | search-reindex submit-regions -  # read from stdin
+#   search-reindex submit --bing-only urls.txt  # only submit to Bing
+#
+# Config: $SCRIPT_DIR/.search-reindex (gitignored)
+# Run 'search-reindex setup' to configure - it will guide you through OAuth setup.
+# Bing submission is optional and can be enabled during setup.
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/.search-reindex"
+API_BASE="https://api.webmaster.yandex.net/v4"
+BING_API_BASE="https://ssl.bing.com/webmaster/api.svc/json"
+
+# Colours
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Timing constants
+URL_DELAY=0.2
+
+# Bing API limits SubmitUrlbatch to 500 URLs per request
+BING_BATCH_SIZE=500
+
+# Format seconds as human-readable duration (e.g., "1m 30s" or "45s")
+format_duration() {
+	seconds=$1
+	if [ "$seconds" -ge 60 ]; then
+		mins=$((seconds / 60))
+		secs=$((seconds % 60))
+		if [ "$secs" -eq 0 ]; then
+			printf "%dm" "$mins"
+		else
+			printf "%dm %ds" "$mins" "$secs"
+		fi
+	else
+		printf "%ds" "$seconds"
+	fi
+}
+
+# Format timestamp as HH:MM:SS
+format_time() {
+	date -r "$1" "+%H:%M:%S" 2>/dev/null || date -d "@$1" "+%H:%M:%S" 2>/dev/null
+}
+
+load_config() {
+	if [ -f "$CONFIG_FILE" ]; then
+		. "$CONFIG_FILE"
+	fi
+}
+
+save_config() {
+	{
+		echo "YANDEX_CLIENT_ID=$YANDEX_CLIENT_ID"
+		echo "YANDEX_OAUTH_TOKEN=$YANDEX_OAUTH_TOKEN"
+		echo "YANDEX_USER_ID=$YANDEX_USER_ID"
+		echo "YANDEX_REGIONS=\"$YANDEX_REGIONS\""
+		for region in $YANDEX_REGIONS; do
+			eval "echo \"YANDEX_HOST_${region}=\$YANDEX_HOST_${region}\""
+			eval "echo \"YANDEX_URL_${region}=\$YANDEX_URL_${region}\""
+		done
+		# Bing settings (optional)
+		if [ -n "${BING_API_KEY:-}" ]; then
+			echo "BING_API_KEY=$BING_API_KEY"
+			echo "BING_SITE_URL=$BING_SITE_URL"
+		fi
+	} >"$CONFIG_FILE"
+	chmod 600 "$CONFIG_FILE"
+	printf "${GREEN}Config saved to %s${NC}\n" "$CONFIG_FILE"
+}
+
+api_call() {
+	method=$1
+	endpoint=$2
+	data=${3:-}
+
+	if [ -z "${YANDEX_OAUTH_TOKEN:-}" ]; then
+		printf "${RED}Error: YANDEX_OAUTH_TOKEN not set${NC}\n"
+		echo "Run 'search-reindex setup' to configure"
+		exit 1
+	fi
+
+	if [ "$method" = "GET" ]; then
+		curl -s -X GET "$API_BASE$endpoint" \
+			-H "Authorization: OAuth $YANDEX_OAUTH_TOKEN" \
+			-H "Content-Type: application/json"
+	else
+		curl -s -X POST "$API_BASE$endpoint" \
+			-H "Authorization: OAuth $YANDEX_OAUTH_TOKEN" \
+			-H "Content-Type: application/json" \
+			-d "$data"
+	fi
+}
+
+# Submit a single chunk of up to BING_BATCH_SIZE URLs to Bing.
+# Caller must ensure the chunk does not exceed the API limit.
+bing_submit_chunk() {
+	chunk_urls=$1
+	chunk_count=$(echo "$chunk_urls" | wc -l | tr -d ' ')
+
+	url_json=$(echo "$chunk_urls" | jq -R . | jq -s .)
+	payload=$(jq -n --arg site "$BING_SITE_URL" --argjson urls "$url_json" \
+		'{siteUrl: $site, urlList: $urls}')
+
+	response=$(curl -s -X POST "${BING_API_BASE}/SubmitUrlbatch?apikey=${BING_API_KEY}" \
+		-H "Content-Type: application/json" \
+		-d "$payload")
+
+	# Bing returns {"d":null} on success
+	if echo "$response" | grep -q '"d":null'; then
+		printf "${GREEN}✓${NC} Bing: %s URLs submitted successfully\n" "$chunk_count"
+	else
+		error_msg=$(echo "$response" | jq -r '.Message // .ErrorCode // "Unknown error"' 2>/dev/null || echo "$response")
+		printf "${RED}✗${NC} Bing batch failed: %s\n" "$error_msg"
+	fi
+}
+
+# Submit multiple URLs to Bing, splitting into chunks of BING_BATCH_SIZE.
+# Usage: bing_submit_batch url1 url2 url3 ...
+#    or: echo -e "url1\nurl2" | bing_submit_batch
+bing_submit_batch() {
+	if [ -z "${BING_API_KEY:-}" ]; then
+		return 0
+	fi
+
+	# Collect URLs from arguments or stdin
+	if [ $# -gt 0 ]; then
+		urls=$(printf '%s\n' "$@")
+	else
+		urls=$(cat)
+	fi
+
+	# Skip if no URLs
+	[ -z "$urls" ] && return 0
+
+	url_count=$(echo "$urls" | wc -l | tr -d ' ')
+
+	if [ "$url_count" -le "$BING_BATCH_SIZE" ]; then
+		printf "${CYAN}Submitting %s URLs to Bing...${NC}\n" "$url_count"
+		bing_submit_chunk "$urls"
+		return
+	fi
+
+	chunk_dir=$(mktemp -d)
+	echo "$urls" | split -l "$BING_BATCH_SIZE" - "$chunk_dir/chunk_"
+	total_batches=$(find "$chunk_dir" -name 'chunk_*' | wc -l | tr -d ' ')
+
+	printf "${CYAN}Submitting %s URLs to Bing in %s batches of up to %s...${NC}\n" \
+		"$url_count" "$total_batches" "$BING_BATCH_SIZE"
+
+	batch_num=0
+	for chunk_file in "$chunk_dir"/chunk_*; do
+		batch_num=$((batch_num + 1))
+		printf "${CYAN}  Batch %d/%d:${NC} " "$batch_num" "$total_batches"
+		bing_submit_chunk "$(cat "$chunk_file")"
+	done
+
+	rm -rf "$chunk_dir"
+}
+
+cmd_setup() {
+	load_config
+
+	if [ -z "${YANDEX_OAUTH_TOKEN:-}" ]; then
+		if [ -z "${YANDEX_CLIENT_ID:-}" ]; then
+			printf "${YELLOW}OAuth App Setup:${NC}\n"
+			echo "1. Go to https://oauth.yandex.ru/client/new"
+			echo "2. Fill in app name (e.g., 'Webmaster Reindex')"
+			echo "3. In 'Platforms', select 'Web services'"
+			echo "4. Click 'Add URL for development' in Redirect URI"
+			echo "5. In 'Access', find 'Yandex.Webmaster' and enable:"
+			echo "   - webmaster:verify"
+			echo "   - webmaster:hostinfo"
+			echo "6. Click 'Create app'"
+			echo ""
+			printf "Enter your Client ID: "
+			read -r YANDEX_CLIENT_ID
+		fi
+
+		echo ""
+		printf "${YELLOW}Get OAuth Token:${NC}\n"
+		echo "Visit this URL and click 'Allow':"
+		printf "${GREEN}https://oauth.yandex.ru/authorize?response_type=token&client_id=%s${NC}\n" "$YANDEX_CLIENT_ID"
+		echo ""
+		printf "After redirect, copy the token from the URL and paste here: "
+		read -r YANDEX_OAUTH_TOKEN
+	fi
+
+	printf "${YELLOW}Fetching user ID...${NC}\n"
+	user_response=$(api_call GET "/user")
+	YANDEX_USER_ID=$(echo "$user_response" | jq -r '.user_id')
+
+	if [ "$YANDEX_USER_ID" = "null" ] || [ -z "$YANDEX_USER_ID" ]; then
+		printf "${RED}Failed to get user ID. Response:${NC}\n"
+		echo "$user_response"
+		exit 1
+	fi
+
+	printf "${GREEN}User ID: %s${NC}\n" "$YANDEX_USER_ID"
+
+	printf "${YELLOW}Fetching hosts...${NC}\n"
+	hosts_response=$(api_call GET "/user/$YANDEX_USER_ID/hosts")
+
+	# Build list of hosts
+	hosts_list=$(echo "$hosts_response" | jq -r '.hosts[] | "\(.host_id)|\(.ascii_host_url)"')
+
+	echo ""
+	printf "${YELLOW}Available hosts:${NC}\n"
+	i=1
+	echo "$hosts_list" | while IFS='|' read -r host_id host_url; do
+		printf "  ${CYAN}%d)${NC} %s\n" "$i" "$host_url"
+		i=$((i + 1))
+	done
+
+	# Select main domain
+	echo ""
+	printf "${YELLOW}Select MAIN domain (number):${NC} "
+	read -r main_choice
+
+	# Parse selection
+	main_line=$(echo "$hosts_list" | sed -n "${main_choice}p")
+	main_host_id=$(echo "$main_line" | cut -d'|' -f1)
+	main_host_url=$(echo "$main_line" | cut -d'|' -f2 | sed 's|/$||')
+
+	if [ -z "$main_host_id" ]; then
+		printf "${RED}Invalid selection${NC}\n"
+		exit 1
+	fi
+
+	printf "${GREEN}Main domain: %s${NC}\n" "$main_host_url"
+
+	# Initialize regions with main
+	YANDEX_REGIONS="main"
+	YANDEX_HOST_main="$main_host_id"
+	YANDEX_URL_main="$main_host_url"
+
+	# Extract main domain for subdomain detection
+	main_domain=$(echo "$main_host_url" | sed 's|https://||; s|http://||; s|www\.||')
+
+	# Find subdomains of the main domain
+	echo "$hosts_list" | while IFS='|' read -r host_id host_url; do
+		# Skip main domain itself
+		[ "$host_id" = "$main_host_id" ] && continue
+		# Check if it's a subdomain of main
+		if echo "$host_url" | grep -q "\.${main_domain}"; then
+			subdomain=$(echo "$host_url" | sed "s|https://||; s|http://||; s|\.${main_domain}.*||")
+			echo "$subdomain|$host_id|$host_url"
+		fi
+	done >/tmp/yandex_subdomains_$$
+
+	if [ -s /tmp/yandex_subdomains_$$ ]; then
+		echo ""
+		printf "${YELLOW}Found subdomains of %s:${NC}\n" "$main_domain"
+		i=1
+		while IFS='|' read -r subdomain host_id host_url; do
+			printf "  ${CYAN}%d)${NC} %s (%s)\n" "$i" "$subdomain" "$host_url"
+			i=$((i + 1))
+		done </tmp/yandex_subdomains_$$
+
+		echo ""
+		printf "${YELLOW}Enter subdomain numbers to add (space-separated), or press Enter to skip:${NC} "
+		read -r subdomain_choices
+
+		if [ -n "$subdomain_choices" ]; then
+			for choice in $subdomain_choices; do
+				sub_line=$(sed -n "${choice}p" /tmp/yandex_subdomains_$$)
+				if [ -n "$sub_line" ]; then
+					subdomain=$(echo "$sub_line" | cut -d'|' -f1)
+					host_id=$(echo "$sub_line" | cut -d'|' -f2)
+					host_url=$(echo "$sub_line" | cut -d'|' -f3 | sed 's|/$||')
+
+					YANDEX_REGIONS="$YANDEX_REGIONS $subdomain"
+					eval "YANDEX_HOST_${subdomain}=\"$host_id\""
+					eval "YANDEX_URL_${subdomain}=\"$host_url\""
+					printf "${GREEN}Added: %s (%s)${NC}\n" "$subdomain" "$host_url"
+				fi
+			done
+		fi
+	fi
+
+	rm -f /tmp/yandex_subdomains_$$
+
+	# Bing setup (optional)
+	echo ""
+	printf "${YELLOW}=== Bing Webmaster Setup (optional) ===${NC}\n"
+
+	if [ -n "${BING_API_KEY:-}" ]; then
+		echo "Bing is currently configured for: $BING_SITE_URL"
+		printf "Reconfigure Bing? [y/N]: "
+		read -r setup_bing
+	else
+		echo "Bing uses a simple API key for URL submission."
+		echo ""
+		printf "Set up Bing submission? [y/N]: "
+		read -r setup_bing
+	fi
+
+	if [ "$setup_bing" = "y" ] || [ "$setup_bing" = "Y" ]; then
+		echo ""
+		printf "${YELLOW}To get your Bing API key:${NC}\n"
+		echo "1. Go to: ${CYAN}https://www.bing.com/webmasters/home?siteUrl=${YANDEX_URL_main}/${NC}"
+		echo "2. Sign in and add/verify your site if not done"
+		echo "3. Click 'API access' in the left menu"
+		echo "4. Click 'Generate' to create an API key, then copy it"
+		echo ""
+		printf "Enter your Bing API key (or press Enter to disable): "
+		read -r new_bing_key
+
+		if [ -n "$new_bing_key" ]; then
+			BING_API_KEY="$new_bing_key"
+			# Use the main domain URL for Bing
+			BING_SITE_URL="$YANDEX_URL_main"
+			printf "${GREEN}Bing configured for: %s${NC}\n" "$BING_SITE_URL"
+		else
+			BING_API_KEY=""
+			BING_SITE_URL=""
+			printf "${YELLOW}Bing disabled${NC}\n"
+		fi
+	fi
+
+	save_config
+
+	echo ""
+	printf "${GREEN}Setup complete!${NC}\n"
+	echo ""
+	echo "Yandex regions:"
+	for region in $YANDEX_REGIONS; do
+		eval "url=\$YANDEX_URL_${region}"
+		eval "host=\$YANDEX_HOST_${region}"
+		echo "  $region: $url (host: $host)"
+	done
+
+	if [ -n "${BING_API_KEY:-}" ]; then
+		echo ""
+		echo "Bing: $BING_SITE_URL (enabled)"
+	else
+		echo ""
+		echo "Bing: not configured (run setup again to add)"
+	fi
+}
+
+cmd_list() {
+	load_config
+
+	if [ -z "${YANDEX_USER_ID:-}" ]; then
+		printf "${RED}Run 'search-reindex setup' first${NC}\n"
+		exit 1
+	fi
+
+	printf "${YELLOW}Fetching hosts for user %s...${NC}\n" "$YANDEX_USER_ID"
+	hosts_response=$(api_call GET "/user/$YANDEX_USER_ID/hosts")
+
+	echo "$hosts_response" | jq -r '.hosts[] | "\(.host_id)\t\(.ascii_host_url)\t\(.main_mirror // "n/a")"' |
+		column -t -s '	'
+}
+
+get_host_id_for_url() {
+	url=$1
+	url_domain=$(echo "$url" | sed 's|https://||; s|/.*||')
+
+	# Try to match against configured regions (check subdomains before main)
+	# Reverse the order so subdomains are checked first
+	regions_reversed=""
+	for region in $YANDEX_REGIONS; do
+		regions_reversed="$region $regions_reversed"
+	done
+
+	for region in $regions_reversed; do
+		eval "region_url=\$YANDEX_URL_${region}"
+		region_domain=$(echo "$region_url" | sed 's|https://||; s|/.*||')
+		if [ "$url_domain" = "$region_domain" ]; then
+			eval "echo \$YANDEX_HOST_${region}"
+			return
+		fi
+	done
+
+	# Fallback to main
+	echo "$YANDEX_HOST_main"
+}
+
+check_yandex_quota() {
+	# quota is shared across all regions, any host_id works
+	host_id=$YANDEX_HOST_main
+	response=$(api_call GET "/user/$YANDEX_USER_ID/hosts/$host_id/recrawl/quota")
+	echo "$response" | jq -r '.quota_remainder // 0'
+}
+
+cmd_quota() {
+	load_config
+	host_id=$YANDEX_HOST_main
+	response=$(api_call GET "/user/$YANDEX_USER_ID/hosts/$host_id/recrawl/quota")
+	daily=$(echo "$response" | jq -r '.daily_quota // 0')
+	remaining=$(echo "$response" | jq -r '.quota_remainder // 0')
+	used=$((daily - remaining))
+	if [ "$daily" -gt 0 ]; then
+		pct=$((used * 100 / daily))
+	else
+		pct=0
+	fi
+	printf "${CYAN}Yandex recrawl quota${NC} (shared across all verified hosts)\n"
+	printf "  Daily limit: %s\n" "$daily"
+	printf "  Used today:  %s (%s%%)\n" "$used" "$pct"
+	printf "  Remaining:   ${GREEN}%s${NC}\n" "$remaining"
+}
+
+submit_url() {
+	url=$1
+	host_id=$(get_host_id_for_url "$url")
+
+	if [ -z "$host_id" ]; then
+		printf "${RED}No host ID found for: %s${NC}\n" "$url"
+		return 1
+	fi
+
+	response=$(api_call POST "/user/$YANDEX_USER_ID/hosts/$host_id/recrawl/queue" "$(jq -n --arg url "$url" '{url: $url}')")
+	task_id=$(echo "$response" | jq -r '.task_id // empty')
+	quota=$(echo "$response" | jq -r '.quota_remainder // empty')
+	error=$(echo "$response" | jq -r '.error_code // empty')
+
+	if [ -n "$task_id" ]; then
+		printf "${GREEN}✓${NC} Yandex: %s (quota: %s)\n" "$url" "$quota"
+	elif [ "$error" = "URL_ALREADY_ADDED" ]; then
+		printf "${YELLOW}○${NC} Yandex: %s (already queued)\n" "$url"
+	else
+		printf "${RED}✗${NC} Yandex: %s\n" "$url"
+		echo "  Error: $response"
+	fi
+}
+
+cmd_submit_url() {
+	load_config
+
+	bing_only=0
+	if [ "${1:-}" = "--bing-only" ]; then
+		bing_only=1
+		shift
+	fi
+
+	if [ "$bing_only" -eq 1 ]; then
+		if [ -z "${BING_API_KEY:-}" ]; then
+			printf "${RED}--bing-only requires Bing to be configured. Run 'search-reindex setup'.${NC}\n"
+			exit 1
+		fi
+	elif [ -z "${YANDEX_USER_ID:-}" ]; then
+		printf "${RED}Run 'search-reindex setup' first${NC}\n"
+		exit 1
+	fi
+
+	if [ $# -eq 0 ]; then
+		echo "Usage: search-reindex submit-url [--bing-only] <url> [<url>...]"
+		exit 1
+	fi
+
+	if [ "$bing_only" -eq 0 ]; then
+		# Check quota
+		quota=$(check_yandex_quota)
+		printf "${CYAN}Yandex quota:${NC} %s remaining (shared across all regions)\n" "$quota"
+	fi
+
+	# Submit all URLs to Bing first (batch)
+	bing_submit_batch "$@"
+	echo ""
+
+	if [ "$bing_only" -eq 1 ]; then
+		return 0
+	fi
+
+	# Then submit to Yandex one by one
+	printf "${YELLOW}Submitting to Yandex...${NC}\n"
+	for url in "$@"; do
+		submit_url "$url"
+		# Small delay between URLs to avoid rate limiting
+		if [ $# -gt 1 ]; then
+			sleep "$URL_DELAY"
+		fi
+	done
+}
+
+cmd_submit() {
+	load_config
+
+	bing_only=0
+	if [ "${1:-}" = "--bing-only" ]; then
+		bing_only=1
+		shift
+	fi
+
+	if [ "$bing_only" -eq 1 ]; then
+		if [ -z "${BING_API_KEY:-}" ]; then
+			printf "${RED}--bing-only requires Bing to be configured. Run 'search-reindex setup'.${NC}\n"
+			exit 1
+		fi
+	elif [ -z "${YANDEX_USER_ID:-}" ]; then
+		printf "${RED}Run 'search-reindex setup' first${NC}\n"
+		exit 1
+	fi
+
+	file=${1:-}
+	if [ -z "$file" ] || [ ! -f "$file" ]; then
+		echo "Usage: search-reindex submit [--bing-only] <file_with_urls>"
+		exit 1
+	fi
+
+	# Count actual URLs (excluding empty lines and comments)
+	total=$(grep -v '^\s*$\|^\s*#' "$file" | wc -l | tr -d ' ')
+	count=0
+	start_time=$(date +%s)
+
+	if [ "$bing_only" -eq 0 ]; then
+		# Check Yandex quota before starting
+		quota=$(check_yandex_quota)
+		usable=$((quota > 0 ? quota - 1 : 0))
+		printf "${CYAN}Yandex quota:${NC} %s remaining (shared across all regions, keeping 1 reserve)\n" "$quota"
+		if [ "$total" -gt "$usable" ]; then
+			printf "${YELLOW}⚠${NC}  Can submit %s of %s URLs to Yandex (quota limit)\n" "$usable" "$total"
+		fi
+
+		# Calculate timing (Yandex only, Bing is instant batch)
+		yandex_total=$((total < usable ? total : usable))
+		est_seconds=$(echo "$yandex_total 0.7" | awk '{printf "%.0f", $1 * $2}')
+		end_time=$((start_time + est_seconds))
+
+		printf "${YELLOW}Submitting %s URLs for reindexing...${NC}\n" "$total"
+		printf "${CYAN}Started:${NC}   %s\n" "$(format_time "$start_time")"
+		printf "${CYAN}Duration:${NC}  ~%s\n" "$(format_duration "$est_seconds")"
+		printf "${CYAN}ETA:${NC}       %s\n" "$(format_time "$end_time")"
+		echo ""
+	else
+		printf "${YELLOW}Submitting %s URLs to Bing only...${NC}\n" "$total"
+		echo ""
+	fi
+
+	# Submit all URLs to Bing first (single batch request)
+	grep -v '^\s*$\|^\s*#' "$file" | bing_submit_batch
+	echo ""
+
+	if [ "$bing_only" -eq 1 ]; then
+		actual_end=$(date +%s)
+		actual_duration=$((actual_end - start_time))
+		printf "${GREEN}Done!${NC} Submitted %s URLs to Bing in %s\n" "$total" "$(format_duration "$actual_duration")"
+		return 0
+	fi
+
+	# Then submit to Yandex one by one
+	printf "${YELLOW}Submitting to Yandex...${NC}\n"
+	while IFS= read -r url || [ -n "$url" ]; do
+		# Skip empty lines and comments
+		case "$url" in
+		"" | \#*) continue ;;
+		esac
+
+		# Stop if we've hit the usable quota
+		if [ "$count" -ge "$usable" ]; then
+			printf "${YELLOW}⚠${NC}  Stopping Yandex submissions: quota limit reached (%s/%s URLs sent)\n" "$count" "$total"
+			break
+		fi
+
+		count=$((count + 1))
+		submit_url "$url"
+
+		# Small delay to avoid rate limiting
+		sleep "$URL_DELAY"
+	done <"$file"
+
+	actual_end=$(date +%s)
+	actual_duration=$((actual_end - start_time))
+
+	echo ""
+	printf "${GREEN}Done!${NC} Submitted %s URLs in %s (finished %s)\n" "$count" "$(format_duration "$actual_duration")" "$(format_time "$actual_end")"
+	if [ "$count" -lt "$total" ]; then
+		skipped=$((total - count))
+		printf "${YELLOW}⚠${NC}  %s URLs skipped (Yandex quota). Resume from line %s next session.\n" "$skipped" "$((count + 1))"
+	fi
+}
+
+cmd_submit_regions() {
+	load_config
+
+	bing_only=0
+	if [ "${1:-}" = "--bing-only" ]; then
+		bing_only=1
+		shift
+	fi
+
+	if [ "$bing_only" -eq 1 ] && [ -z "${BING_API_KEY:-}" ]; then
+		printf "${RED}--bing-only requires Bing to be configured. Run 'search-reindex setup'.${NC}\n"
+		exit 1
+	fi
+
+	if [ -z "${YANDEX_USER_ID:-}" ]; then
+		printf "${RED}Run 'search-reindex setup' first${NC}\n"
+		exit 1
+	fi
+
+	if [ -z "${YANDEX_REGIONS:-}" ]; then
+		printf "${RED}No regions configured. Run 'search-reindex setup' first.${NC}\n"
+		exit 1
+	fi
+
+	file=${1:-}
+	stdin_temp=""
+	if [ "$file" = "-" ]; then
+		# Read from stdin into temp file
+		stdin_temp=$(mktemp)
+		cat >"$stdin_temp"
+		file="$stdin_temp"
+	elif [ -z "$file" ] || [ ! -f "$file" ]; then
+		echo "Usage: search-reindex submit-regions [--bing-only] <file_with_relative_urls>"
+		echo "       search-reindex submit-regions [--bing-only] -  # read from stdin"
+		echo "       echo '/catalog/' | search-reindex submit-regions -"
+		echo "Will submit URLs for all configured regions: $YANDEX_REGIONS"
+		echo "File must contain relative URLs starting with / (e.g., /catalog/section/)"
+		exit 1
+	fi
+
+	# Count regions and URLs for timing estimate
+	region_count=0
+	for region in $YANDEX_REGIONS; do
+		eval "base_url=\$YANDEX_URL_${region}"
+		[ -n "$base_url" ] && region_count=$((region_count + 1))
+	done
+
+	# Count actual URLs (excluding empty lines and comments)
+	url_count=$(grep -v '^\s*$\|^\s*#' "$file" | wc -l | tr -d ' ')
+	total_submissions=$((url_count * region_count))
+	start_time=$(date +%s)
+	usable=0
+
+	if [ "$bing_only" -eq 0 ]; then
+		# Check Yandex quota before starting
+		quota=$(check_yandex_quota)
+		usable=$((quota > 0 ? quota - 1 : 0))
+		printf "${CYAN}Yandex quota:${NC} %s remaining (shared across all regions, keeping 1 reserve)\n" "$quota"
+		if [ "$total_submissions" -gt "$usable" ]; then
+			printf "${YELLOW}⚠${NC}  Can submit %s of %s URLs to Yandex (quota limit)\n" "$usable" "$total_submissions"
+		fi
+
+		# Calculate timing (Yandex only, Bing is instant batch)
+		yandex_total=$((total_submissions < usable ? total_submissions : usable))
+		est_seconds=$(echo "$yandex_total 0.7" | awk '{printf "%.0f", $1 * $2}')
+		end_time=$((start_time + est_seconds))
+
+		printf "${YELLOW}Submitting %s URLs × %s regions = %s total submissions${NC}\n" "$url_count" "$region_count" "$total_submissions"
+		printf "${CYAN}Started:${NC}   %s\n" "$(format_time "$start_time")"
+		printf "${CYAN}Duration:${NC}  ~%s\n" "$(format_duration "$est_seconds")"
+		printf "${CYAN}ETA:${NC}       %s\n" "$(format_time "$end_time")"
+		echo ""
+	else
+		printf "${YELLOW}Submitting %s URLs × %s regions = %s total to Bing only${NC}\n" "$url_count" "$region_count" "$total_submissions"
+		echo ""
+	fi
+
+	# Build list of all absolute URLs for Bing batch submission
+	bing_urls_file=$(mktemp)
+	for region in $YANDEX_REGIONS; do
+		eval "base_url=\$YANDEX_URL_${region}"
+		[ -z "$base_url" ] && continue
+
+		while IFS= read -r url || [ -n "$url" ]; do
+			case "$url" in "" | \#*) continue ;; esac
+			echo "$url" | grep -q '^/' && echo "${base_url}${url}" >>"$bing_urls_file"
+		done <"$file"
+	done
+
+	# Submit all URLs to Bing first (single batch request)
+	bing_submit_batch <"$bing_urls_file"
+	rm -f "$bing_urls_file"
+	echo ""
+
+	if [ "$bing_only" -eq 1 ]; then
+		actual_end=$(date +%s)
+		actual_duration=$((actual_end - start_time))
+		printf "${GREEN}Done!${NC} Submitted %s URLs to Bing in %s\n" "$total_submissions" "$(format_duration "$actual_duration")"
+		[ -n "$stdin_temp" ] && rm -f "$stdin_temp"
+		return 0
+	fi
+
+	# Then submit to Yandex one by one per region
+	submitted=0
+	for region in $YANDEX_REGIONS; do
+		eval "base_url=\$YANDEX_URL_${region}"
+
+		if [ -z "$base_url" ]; then
+			printf "${YELLOW}Skipping %s (not configured)${NC}\n" "$region"
+			continue
+		fi
+
+		printf "${YELLOW}=== Submitting to Yandex for %s (%s) ===${NC}\n" "$region" "$base_url"
+
+		while IFS= read -r url || [ -n "$url" ]; do
+			case "$url" in
+			"" | \#*) continue ;;
+			esac
+
+			# Only accept relative URLs
+			if ! echo "$url" | grep -q '^/'; then
+				printf "${RED}Skipping non-relative URL: %s${NC}\n" "$url"
+				continue
+			fi
+
+			# Stop if we've hit the usable quota
+			if [ "$submitted" -ge "$usable" ]; then
+				printf "${YELLOW}⚠${NC}  Stopping: quota limit reached (%s/%s submitted)\n" "$submitted" "$total_submissions"
+				break 2
+			fi
+
+			submit_url "${base_url}${url}"
+			submitted=$((submitted + 1))
+			sleep "$URL_DELAY"
+		done <"$file"
+
+		echo ""
+	done
+
+	actual_end=$(date +%s)
+	actual_duration=$((actual_end - start_time))
+
+	printf "${GREEN}Done!${NC} Submitted %s URLs in %s (finished %s)\n" "$submitted" "$(format_duration "$actual_duration")" "$(format_time "$actual_end")"
+	if [ "$submitted" -lt "$total_submissions" ]; then
+		skipped=$((total_submissions - submitted))
+		printf "${YELLOW}⚠${NC}  %s URLs skipped (Yandex quota).\n" "$skipped"
+	fi
+
+	# Clean up stdin temp file if used
+	[ -n "$stdin_temp" ] && rm -f "$stdin_temp"
+	return 0
+}
+
+cmd_diagnostics() {
+	load_config
+
+	if [ -z "${YANDEX_USER_ID:-}" ]; then
+		printf "${RED}Run 'search-reindex setup' first${NC}\n"
+		exit 1
+	fi
+
+	if [ -z "${YANDEX_REGIONS:-}" ]; then
+		printf "${RED}No regions configured. Run 'search-reindex setup' first.${NC}\n"
+		exit 1
+	fi
+
+	has_errors=0
+	total_issues=0
+
+	for region in $YANDEX_REGIONS; do
+		eval "host_id=\$YANDEX_HOST_${region}"
+		eval "base_url=\$YANDEX_URL_${region}"
+
+		if [ -z "$host_id" ]; then
+			printf "${YELLOW}Skipping %s (not configured)${NC}\n" "$region"
+			continue
+		fi
+
+		# Build webmaster URL for this host
+		webmaster_url="https://webmaster.yandex.ru/site/${host_id}/diagnostics/"
+
+		response=$(api_call GET "/user/$YANDEX_USER_ID/hosts/$host_id/diagnostics")
+
+		# Check for API errors
+		error_code=$(echo "$response" | jq -r '.error_code // empty')
+		if [ -n "$error_code" ]; then
+			printf "${RED}✗ %s (%s)${NC}\n" "$region" "$base_url"
+			printf "  API Error: %s\n" "$error_code"
+			has_errors=1
+			continue
+		fi
+
+		# Count issues by severity
+		fatal_count=$(echo "$response" | jq '[.problems | to_entries[] | select(.value.state == "PRESENT" and .value.severity == "FATAL")] | length')
+		critical_count=$(echo "$response" | jq '[.problems | to_entries[] | select(.value.state == "PRESENT" and .value.severity == "CRITICAL")] | length')
+		warning_count=$(echo "$response" | jq '[.problems | to_entries[] | select(.value.state == "PRESENT" and .value.severity == "POSSIBLE_PROBLEM")] | length')
+
+		region_issues=$((fatal_count + critical_count + warning_count))
+		total_issues=$((total_issues + region_issues))
+
+		if [ "$fatal_count" -gt 0 ] || [ "$critical_count" -gt 0 ]; then
+			has_errors=1
+		fi
+
+		# Print region header
+		if [ "$region_issues" -eq 0 ]; then
+			printf "${GREEN}✓ %s (%s)${NC} - no issues\n" "$region" "$base_url"
+		else
+			printf "${RED}✗ %s (%s)${NC} - %d issue(s)\n" "$region" "$base_url" "$region_issues"
+
+			# List FATAL issues
+			if [ "$fatal_count" -gt 0 ]; then
+				echo "$response" | jq -r '.problems | to_entries[] | select(.value.state == "PRESENT" and .value.severity == "FATAL") | "  🔴 FATAL: \(.key)"'
+			fi
+
+			# List CRITICAL issues
+			if [ "$critical_count" -gt 0 ]; then
+				echo "$response" | jq -r '.problems | to_entries[] | select(.value.state == "PRESENT" and .value.severity == "CRITICAL") | "  🟠 CRITICAL: \(.key)"'
+			fi
+
+			# List warnings
+			if [ "$warning_count" -gt 0 ]; then
+				echo "$response" | jq -r '.problems | to_entries[] | select(.value.state == "PRESENT" and .value.severity == "POSSIBLE_PROBLEM") | "  🟡 WARNING: \(.key)"'
+			fi
+
+			printf "  ${CYAN}→ %s${NC}\n" "$webmaster_url"
+		fi
+	done
+
+	echo ""
+	if [ "$total_issues" -eq 0 ]; then
+		printf "${GREEN}All regions OK - no issues detected${NC}\n"
+		exit 0
+	else
+		printf "${YELLOW}Total: %d issue(s) across all regions${NC}\n" "$total_issues"
+		exit "$has_errors"
+	fi
+}
+
+# Main
+case "${1:-}" in
+setup)
+	cmd_setup
+	;;
+list)
+	cmd_list
+	;;
+submit)
+	shift
+	cmd_submit "$@"
+	;;
+submit-url)
+	shift
+	cmd_submit_url "$@"
+	;;
+submit-regions)
+	shift
+	cmd_submit_regions "$@"
+	;;
+diagnostics)
+	cmd_diagnostics
+	;;
+quota)
+	cmd_quota
+	;;
+*)
+	echo "Search Engine URL Reindexing Tool (Yandex + Bing)"
+	echo ""
+	echo "Usage:"
+	echo "  search-reindex setup                 - Interactive setup (OAuth, domains, Bing API)"
+	echo "  search-reindex list                  - List all verified Yandex hosts"
+	echo "  search-reindex quota                 - Show remaining Yandex recrawl quota"
+	echo "  search-reindex submit [--bing-only] <file>         - Submit absolute URLs from file"
+	echo "  search-reindex submit-url [--bing-only] <url>...   - Submit one or more absolute URLs"
+	echo "  search-reindex submit-regions [--bing-only] <file|-> - Submit relative URLs for all regions (use - for stdin)"
+	echo "  search-reindex diagnostics           - Check Yandex site issues (exit 1 if FATAL/CRITICAL)"
+	echo ""
+	echo "Pass --bing-only to skip Yandex submission (e.g. when Yandex quota is exhausted)."
+	echo ""
+	echo "Examples:"
+	echo "  search-reindex submit-url https://example.com/page/"
+	echo "  search-reindex submit-regions urls.txt  # contains /catalog/section/"
+	echo "  echo '/' | search-reindex submit-regions -  # read from stdin"
+	echo "  search-reindex submit --bing-only urls.txt  # only submit to Bing"
+	echo "  search-reindex diagnostics && echo 'All OK'"
+	echo ""
+	echo "Config: \$SCRIPT_DIR/.search-reindex"
+	echo "URLs are submitted to both Yandex and Bing (if configured)."
+	;;
+esac

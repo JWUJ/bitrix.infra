@@ -4,11 +4,28 @@ set -e -u
 # This script sets up clean Ubuntu host machine for bitrix.infra
 # and recovers site files and the DB content from the backup.
 
+# SITE-SPECIFIC operational script: every value below is for favor-group.ru.
+# Forks must replace the variables in this block before use.
 domain="favor-group.ru"
 backup_s3_directory=favor-group-backup
-duplicity_backup_location="boto3+s3://${backup_s3_directory}/duplicity_web_favor-group"
-mysql_restore_hostname="favor-group"
+# Backups sit under the hostname of the machine that made them (duplicity_web_<host>,
+# mysql_<host>). After a failover the newest copies belong to the replacement host, so
+# restore from it with RESTORE_FROM_HOST=<its hostname>.
+restore_from_host="${RESTORE_FROM_HOST:-favor-group}"
+duplicity_backup_location="boto3+s3://${backup_s3_directory}/duplicity_web_${restore_from_host}"
+mysql_restore_hostname="${restore_from_host}"
 mysql_restore_db="favor_group_ru"
+# Where the backups are read from. The defaults read Yandex Object Storage with the default
+# credentials; another store needs its endpoint and, when its keys are not the default ones,
+# the profile that holds them in the deploy user's ~/.aws/credentials.
+restore_s3_endpoint="${RESTORE_S3_ENDPOINT:-https://storage.yandexcloud.net}"
+restore_aws_profile="${RESTORE_AWS_PROFILE:-}"
+# The backups leave out .git, so nested checkouts come back as plain files. List them as
+# space-separated <dir>=<git url> pairs to turn them back into clones of their remotes,
+# fetched with the updater's deploy key, e.g.
+# DR_NESTED_REPOS="private=git@github.com:me/infra-private.git web/prod=git@github.com:me/site.git"
+nested_repos="${DR_NESTED_REPOS:-}"
+github_host_key="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 
 ### Pre-checks
 
@@ -20,13 +37,23 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 46
 fi
 
+# the deploy user (DEPLOY_USER, default admin) and its home
+# shellcheck source=scripts/deploy-user.sh
+. ./scripts/deploy-user.sh
+
 echo "Note: it's safe to run the script multiple times"
 
 ### Functions
 
+# The user who called sudo. logname needs a terminal and fails under a plain `ssh host cmd`.
+login_user() {
+  logname 2>/dev/null || echo "${SUDO_USER:-root}"
+}
+
 setup_aws() {
-  mkdir -p "/home/$(logname)/.aws"
-  chown "$(logname)":"$(id -gn "$(logname)")" "/home/$(logname)/.aws"
+  # The backup scripts and this restore read the keys from the deploy user's ~/.aws (see admin_user_setup).
+  mkdir -p "${deploy_home}/.aws"
+  chown "${deploy_user}":"$(id -gn "${deploy_user}")" "${deploy_home}/.aws"
   if [ ! -f /usr/local/bin/aws ]; then
     curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
     apt-get -y install unzip >/dev/null
@@ -34,16 +61,16 @@ setup_aws() {
     ./aws/install >/dev/null
     rm -rf awscliv2.zip ./aws
   fi
-  if [ ! -f "/home/$(logname)/.aws/config" ]; then
-    echo "[default]\nregion = ru-central1\n" >"/home/$(logname)/.aws/config"
-    chown "$(logname)":"$(id -gn "$(logname)")" "/home/$(logname)/.aws/config"
+  if [ ! -f "${deploy_home}/.aws/config" ]; then
+    echo "[default]\nregion = ru-central1\n" >"${deploy_home}/.aws/config"
+    chown "${deploy_user}":"$(id -gn "${deploy_user}")" "${deploy_home}/.aws/config"
   fi
-  if [ ! -f "/home/$(logname)/.aws/credentials" ]; then
+  if [ ! -f "${deploy_home}/.aws/credentials" ]; then
     echo "!! AWS credentials file is absent, won't be able to restore backups without it !!\n"
     echo "Please go by the link and create new static key for the existing service account:"
-    echo "https://console.yandex.cloud/folders/b1gm2f812hg4h5s5jsgn/iam/service-accounts\n"
+    echo "https://console.yandex.cloud/folders/<your-folder-id>/iam/service-accounts\n"
     echo "\
-You'll get ID and secret key, write them to /home/$(logname)/.aws/credentials in the following format:\n\n\
+You'll get ID and secret key, write them to ${deploy_home}/.aws/credentials in the following format:\n\n\
 [default]\n\
 aws_access_key_id = KEY\n\
 aws_secret_access_key = SECRET_KEY\
@@ -52,12 +79,65 @@ aws_secret_access_key = SECRET_KEY\
   fi
 }
 
+# Host tools the cron scripts need and a fresh image may lack: m4 and pigz for mysql-dump.sh
+# (without m4 the dump fails before writing anything), jq for seo-reindex.sh.
+install_host_packages() {
+  echo "installing host tools (m4, pigz, jq)..."
+  apt-get update -qq >/dev/null
+  apt-get -y install m4 pigz jq >/dev/null
+}
+
+# The deploy user (admin by default) runs several host cron jobs, keeps the backup keys in
+# ~/.aws, and receives the updater's deploys over ssh with passwordless sudo. Containers write
+# as uid 1000, so it is uid 1000: an alias of the login user when that user already has uid 1000.
+admin_user_setup() {
+  if id "${deploy_user}" >/dev/null 2>&1; then
+    if [ "$(id -u "${deploy_user}")" -ne 1000 ]; then
+      echo "${deploy_user} exists with uid $(id -u "${deploy_user}"), but the containers write as uid 1000; fix it by hand" >&2
+      exit 53
+    fi
+  else
+    login_user=$(login_user)
+    if [ "${login_user}" != "root" ] && [ "$(id -u "${login_user}")" -eq 1000 ]; then
+      echo "creating ${deploy_user} as an alias of ${login_user} (uid 1000)"
+      useradd -o -u 1000 -g "$(id -g "${login_user}")" -M -d "/home/${login_user}" -s /bin/bash "${deploy_user}"
+      [ -e "/home/${deploy_user}" ] || ln -s "/home/${login_user}" "/home/${deploy_user}"
+    elif getent passwd 1000 >/dev/null; then
+      echo "uid 1000 belongs to $(getent passwd 1000 | cut -d: -f1), not the login user; create ${deploy_user} by hand" >&2
+      exit 52
+    else
+      echo "creating ${deploy_user} user (uid 1000)"
+      if getent group "${deploy_user}" >/dev/null; then
+        useradd -u 1000 -g "${deploy_user}" -m -d "/home/${deploy_user}" -s /bin/bash "${deploy_user}"
+      else
+        useradd -u 1000 -U -m -d "/home/${deploy_user}" -s /bin/bash "${deploy_user}"
+      fi
+    fi
+  fi
+  # an earlier run may have created the home directory as root before the user existed;
+  # the jobs running as that user then cannot write their caches there
+  admin_home="$(getent passwd "${deploy_user}" | cut -d: -f6)"
+  [ -d "${admin_home}" ] && chown "${deploy_user}":"$(id -gn "${deploy_user}")" "${admin_home}"
+  if getent group docker >/dev/null && ! id -nG "${deploy_user}" | tr ' ' '\n' | grep -qx docker; then
+    usermod -aG docker "${deploy_user}"
+  fi
+  # by uid: sudo names an alias after the first passwd entry with that uid, not "admin"
+  if [ ! -f /etc/sudoers.d/90-bitrix-infra-admin ]; then
+    echo '#1000 ALL=(ALL) NOPASSWD:ALL' >/tmp/90-bitrix-infra-admin
+    visudo -cf /tmp/90-bitrix-infra-admin >/dev/null
+    install -m 0440 /tmp/90-bitrix-infra-admin /etc/sudoers.d/90-bitrix-infra-admin
+    rm -f /tmp/90-bitrix-infra-admin
+  fi
+}
+
 install_docker_if_not_installed() {
   command -v docker >/dev/null && return
   echo "docker is installing..."
-  # set low enough docker MTU to work with host machine MTU of 1450
-  mkdir -p /etc/docker
-  echo '{"mtu": 1422}' >/etc/docker/daemon.json
+  if on_yandex_cloud; then
+    # set low enough docker MTU to work with host machine MTU of 1450
+    mkdir -p /etc/docker
+    echo '{"mtu": 1422}' >/etc/docker/daemon.json
+  fi
 
   apt-get update >/dev/null
   apt-get -y install \
@@ -77,20 +157,27 @@ install_docker_if_not_installed() {
 
   apt-get -y install docker-ce docker-ce-cli containerd.io >/dev/null
   # add current user to docker group
-  [ "$(logname)" != "root" ] && usermod -aG docker "$(logname)"
+  [ "$(login_user)" != "root" ] && usermod -aG docker "$(login_user)"
   echo "docker is installed"
 }
 
 install_docker_compose_if_not_installed() {
-  command -v docker-compose >/dev/null && return
-  echo "docker-compose is installing..."
-  curl -sL "https://github.com/docker/compose/releases/download/1.28.6/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-  chmod +x /usr/local/bin/docker-compose
-  echo "docker-compose is installed"
+  if docker compose version >/dev/null 2>&1; then
+    return
+  fi
+  echo "docker-compose-plugin is installing..."
+  apt-get update -qq && apt-get -y install docker-compose-plugin >/dev/null
+  echo "docker-compose-plugin is installed"
+}
+
+# Yandex Cloud VMs report "Yandex" as the DMI system vendor; other hosts keep their own network settings.
+on_yandex_cloud() {
+  grep -qx Yandex /sys/class/dmi/id/sys_vendor 2>/dev/null
 }
 
 # Necessary for Yandex with DDoS Protection enabled https://cloud.yandex.com/en/docs/vpc/concepts/mtu-mss
 set_mtu_1450_if_not_set() {
+  on_yandex_cloud || return 0
   if [ "$(cat /sys/class/net/eth0/mtu)" -eq 1450 ]; then return; fi
   echo "setting mtu to 1450..."
   cat <<EOF >/etc/netplan/90-mtu.yaml
@@ -100,22 +187,32 @@ network:
     eth0:
       mtu: 1450
 EOF
+  # netplan refuses to keep its configuration readable by others
+  chmod 600 /etc/netplan/90-mtu.yaml
   netplan apply
   echo "done, mtu is $(cat /sys/class/net/eth0/mtu)"
 }
 
 create_host_cronjob_if_not_exist() {
-  [ -f "/etc/cron.d/bitrix_infra" ] && return
-  echo "creating /etc/cron.d/bitrix_infra from ./config/cron/host.cron..."
-  ln -s "${PWD}/config/cron/host.cron" /etc/cron.d/bitrix_infra
-  echo "created /etc/cron.d/bitrix_infra"
+  if [ ! -f "/etc/cron.d/bitrix_infra" ]; then
+    echo "creating /etc/cron.d/bitrix_infra from ./config/cron/host.cron..."
+    ln -s "${PWD}/config/cron/host.cron" /etc/cron.d/bitrix_infra
+    echo "created /etc/cron.d/bitrix_infra"
+  fi
+  # site-specific host cron from the private overlay, if checked out
+  if [ -f "${PWD}/private/cron/host-site.cron" ] && [ ! -f "/etc/cron.d/bitrix_site" ]; then
+    chown root:root "${PWD}/private/cron/host-site.cron"
+    chmod 0644 "${PWD}/private/cron/host-site.cron"
+    ln -s "${PWD}/private/cron/host-site.cron" /etc/cron.d/bitrix_site
+    echo "created /etc/cron.d/bitrix_site"
+  fi
 }
 
 zabbix_setup() {
   [ -f "/etc/systemd/system/set-zabbix-docker-acl.service" ] && return
   echo "creating zabbix user and group"
   groupadd -g 1997 zabbix
-  useradd -u 1997 -g zabbix -G docker zabbix
+  useradd -u 1997 -g zabbix -G docker -s /usr/sbin/nologin zabbix
   echo "creating a service 'set-zabbix-docker-acl' which will allow zabbix to read and write docker socket"
   cat <<EOF >/etc/systemd/system/set-zabbix-docker-acl.service
 [Unit]
@@ -137,6 +234,22 @@ EOF
   echo "done the zabbix set up"
 }
 
+# dockerd recreates its socket whenever it restarts, a package upgrade included, and the new
+# socket has no ACL entry for zabbix, so the boot-time unit alone leaves the agent blind to
+# Docker until the next reboot. Re-apply the ACL every time docker.service starts.
+zabbix_docker_acl_dropin() {
+  dropin=/etc/systemd/system/docker.service.d/zabbix-acl.conf
+  [ -f "${dropin}" ] && return
+  mkdir -p "$(dirname "${dropin}")"
+  cat <<EOF >"${dropin}"
+[Service]
+# "-" keeps a failing setfacl from failing docker.service and stopping every container
+ExecStartPost=-/usr/bin/setfacl -m u:zabbix:rw /var/run/docker.sock
+EOF
+  systemctl daemon-reload
+  echo "created ${dropin}"
+}
+
 memcached_user_setup() {
   if ! getent group | cut -d: -f3 | grep -qx '11211'; then
     echo "creating memcached group"
@@ -145,7 +258,7 @@ memcached_user_setup() {
 
   if ! getent passwd | cut -d: -f3 | grep -qx '11211'; then
     echo "creating memcached user"
-    useradd -u 11211 -g memcached memcached
+    useradd -u 11211 -g memcached -s /usr/sbin/nologin memcached
   fi
 }
 
@@ -157,7 +270,7 @@ mysql_user_setup() {
 
   if ! getent passwd | cut -d: -f3 | grep -qx '1001'; then
     echo "creating mysql user"
-    useradd -u 1001 -g mysql mysql
+    useradd -u 1001 -g mysql -s /usr/sbin/nologin mysql
   fi
 }
 
@@ -167,6 +280,112 @@ set_up_duplicity() {
   add-apt-repository -y ppa:duplicity-team/duplicity-release-git >/dev/null
   apt-get -y install duplicity python3-boto3 >/dev/null
   echo "done setting up duplicity"
+}
+
+# The updater container deploys over ssh as admin with private/updater_ssh_key (config/updater.yaml).
+updater_access_setup() {
+  [ -f ./private/updater_ssh_key ] || return 0
+  pubkey=$(ssh-keygen -y -f ./private/updater_ssh_key)
+  # sshd looks in the home from passwd, which for an existing user may not be /home/<user>
+  ssh_dir="$(getent passwd "${deploy_user}" | cut -d: -f6)/.ssh"
+  mkdir -p "${ssh_dir}"
+  touch "${ssh_dir}/authorized_keys"
+  if ! grep -qxF "${pubkey}" "${ssh_dir}/authorized_keys"; then
+    # a file without a final newline would glue the new key onto its last line
+    [ -z "$(tail -c1 "${ssh_dir}/authorized_keys")" ] || echo >>"${ssh_dir}/authorized_keys"
+    echo "${pubkey}" >>"${ssh_dir}/authorized_keys"
+  fi
+  chown -R "${deploy_user}":"$(id -gn "${deploy_user}")" "${ssh_dir}"
+  chmod 0700 "${ssh_dir}"
+  chmod 0600 "${ssh_dir}/authorized_keys"
+}
+
+# GitHub's published host key, so neither the clone below nor the deploys as admin stop at
+# an unknown host prompt.
+github_known_host() {
+  for home in /root "$(getent passwd "${deploy_user}" | cut -d: -f6)"; do
+    mkdir -p "${home}/.ssh"
+    touch "${home}/.ssh/known_hosts"
+    grep -qxF "${github_host_key}" "${home}/.ssh/known_hosts" || echo "${github_host_key}" >>"${home}/.ssh/known_hosts"
+  done
+  chown -R "${deploy_user}":"$(id -gn "${deploy_user}")" "$(getent passwd "${deploy_user}" | cut -d: -f6)/.ssh"
+}
+
+# Turns each restored checkout without .git back into a clone of its remote at origin/master,
+# keeping the restored files as the worktree: `git status` then shows what differed from the
+# remote at backup time. Needs the updater deploy key restored with private/.
+nested_repos_setup() {
+  [ -n "${nested_repos}" ] || return 0
+  [ -f ./private/updater_ssh_key ] || {
+    echo "private/updater_ssh_key is absent, nested checkouts stay without .git"
+    return 0
+  }
+  github_known_host
+  key="${PWD}/private/updater_ssh_key"
+  for entry in ${nested_repos}; do
+    dir="${entry%%=*}"
+    url="${entry#*=}"
+    [ -d "${dir}" ] || continue
+    if [ -e "${dir}/.git" ]; then
+      # a .git without a commit is what an interrupted earlier run leaves behind
+      git -c safe.directory='*' -C "${dir}" rev-parse -q --verify HEAD >/dev/null && continue
+      rm -rf "${dir}/.git"
+    fi
+    echo "turning ${dir} back into a clone of ${url}..."
+    (
+      cd "${dir}"
+      export GIT_SSH_COMMAND="ssh -i ${key} -o IdentitiesOnly=yes -o BatchMode=yes"
+      # root works on a tree that fix-rights already gave to admin
+      export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
+      git init -q -b master
+      git remote add origin "${url}"
+      git fetch -q origin
+      git reset -q origin/master
+      git branch -q -u origin/master
+      echo "${dir}: $(git status --porcelain | wc -l) paths differ from origin/master"
+    )
+  done
+}
+
+# The host cron jobs and the deploys read DEPLOY_USER from .env, which the restore brings back.
+# A user given on the command line is written there; a different one in the restored .env stops
+# the run, since the steps so far set up the wrong account.
+deploy_user_check() {
+  restored_user=$(env -u DEPLOY_USER sh -c '. ./scripts/deploy-user.sh; echo "${deploy_user}"')
+  [ "${restored_user}" = "${deploy_user}" ] && return 0
+  if [ -n "${DEPLOY_USER:-}" ]; then
+    { grep -v '^DEPLOY_USER=' ./.env 2>/dev/null || true; } >./.env.tmp
+    echo "DEPLOY_USER=${deploy_user}" >>./.env.tmp
+    mv ./.env.tmp ./.env
+    echo "wrote DEPLOY_USER=${deploy_user} to .env for the cron jobs and deploys"
+  else
+    echo "The restored .env sets DEPLOY_USER=${restored_user}: repeat this run with DEPLOY_USER=${restored_user}" >&2
+    echo "added to its environment, keeping any RESTORE_*, DR_NESTED_REPOS and COMPOSE_PROFILES you passed." >&2
+    if [ "$(id -u "${deploy_user}" 2>/dev/null || true)" = 1000 ] && ! id "${restored_user}" >/dev/null 2>&1; then
+      echo "This run already made ${deploy_user} the uid 1000 account; rename it first:" >&2
+      echo "  sudo usermod -l ${restored_user} -d /home/${restored_user} -m ${deploy_user}" >&2
+    fi
+    exit 54
+  fi
+}
+
+# Site-specific steps live in the private overlay: private/scripts/dr-hook.sh is called with
+# "pre-start" before the containers start and with "post-db" after the DB is restored.
+private_hook() {
+  [ -x ./private/scripts/dr-hook.sh ] || return 0
+  echo "running private/scripts/dr-hook.sh $1..."
+  ./private/scripts/dr-hook.sh "$1"
+}
+
+# A second backup destination (BACKUP2_* in backup.env) needs its keys under its own profile.
+check_second_backup_destination() {
+  [ -f ./private/environment/backup.env ] || return 0
+  profile=$(sed -n 's/^BACKUP2_AWS_PROFILE=//p' ./private/environment/backup.env | tr -d "\"'")
+  [ -n "${profile}" ] || return 0
+  if ! grep -qx "\[${profile}\]" ${deploy_home}/.aws/credentials; then
+    echo "\nbackup.env sends backups to a second destination with the AWS profile '${profile}',"
+    echo "but ${deploy_home}/.aws/credentials has no [${profile}] section: add that destination's keys there."
+  fi
 }
 
 final_ip_check() {
@@ -187,22 +406,54 @@ https://connect.yandex.ru/portal/services/webmaster/resources/${domain} \
 }
 
 backup_restore() {
-  if [ -d "./private" ]; then
-    echo "${PWD}/private folder already exist, delete it if you want to restore files from backup"
+  # Idempotency marker: gate on a flag the restore itself writes, NOT on the mere
+  # existence of ./private — that directory is tracked in git (ships *.env.example,
+  # phpstan/), so it is ALWAYS present on a fresh clone and a `[ -d ./private ]` check
+  # silently skips the entire S3 restore on every run.
+  restore_marker="${PWD}/.dr-file-restore-done"
+  if [ -f "${restore_marker}" ]; then
+    echo "file restore already completed (${restore_marker} present); skipping. Delete it to re-restore."
     return
   fi
-  echo "Restoring file backup..."
-  HOME="/home/$(logname)" duplicity \
+  # duplicity 3.x (Ubuntu 24.04) REFUSES to restore into a non-empty target ("--force"
+  # no longer covers restore as it did in 0.8.x), and the clone already populated ${PWD}.
+  # So restore into an empty staging dir, then merge over the clone — the real private/
+  # secrets, web/prod and the override symlink overwrite the tracked placeholders.
+  echo "Restoring file backup to staging directory..."
+  staging="${PWD}/.dr-restore"
+  rm -rf "${staging}"
+  mkdir -p "${staging}" "${PWD}/logs"
+  env HOME="${deploy_home}" ${restore_aws_profile:+"AWS_PROFILE=${restore_aws_profile}"} duplicity \
     --no-encryption \
-    --s3-endpoint-url https://storage.yandexcloud.net \
-    --log-file /web/logs/duplicity.log \
+    --s3-endpoint-url "${restore_s3_endpoint}" \
+    --log-file "${PWD}/logs/duplicity.log" \
     --archive-dir /root/.cache/duplicity \
     --force \
-    "${duplicity_backup_location}" "${PWD}"
-  echo "Server has latest backup of files and DB restored!"
+    "${duplicity_backup_location}" "${staging}"
+  # duplicity 3.x prints no completion summary, so assert the restore actually produced
+  # the secrets we depend on before merging (catches a silent/partial restore).
+  if [ ! -f "${staging}/private/environment/mysql.env" ]; then
+    echo "ERROR: restore did not produce private/environment/mysql.env — aborting." >&2
+    exit 49
+  fi
+  echo "merging restored files into ${PWD} (this can take a few minutes)..."
+  cp -a "${staging}/." "${PWD}/"
+  rm -rf "${staging}"
+  # The merge also brought back the backup's copies of this repository's own files, which can
+  # be older than the clone (the second run of the script would then be an old version).
+  git -c safe.directory='*' checkout -- .
+  touch "${restore_marker}"
+  echo "Server has latest backup of files restored!"
   echo "Linking logrotate configuration to /etc/logrotate.d/..."
   ln -sf /web/config/logrotate/* /etc/logrotate.d/
   ./scripts/fix-rights.sh
+}
+
+# true once the final mysqld (process 1 after the entrypoint's exec) accepts the root login
+mysql_ready() {
+  pid1=$(docker exec mysql sh -c 'tr "\000" "\n" </proc/1/cmdline | head -1' 2>/dev/null) || return 1
+  case "${pid1}" in mysqld | */mysqld) ;; *) return 1 ;; esac
+  docker exec -u0 mysql /bin/mysql --defaults-extra-file="${mysql_config_inside_container}" -N -e "select 1" >/dev/null 2>&1
 }
 
 restore_mysql() {
@@ -210,19 +461,29 @@ restore_mysql() {
   backup_directory_path="./backup/"
 
   # retrieving last backup from the S3
+  # Select the most-recent DATED daily dump that is large enough to be real:
+  #  - grep keeps only keys under a /YYYY-MM-DD/ folder, excluding ad-hoc dumps like
+  #    pre-8.4-upgrade/ (which otherwise sorts LAST lexically and would be picked by a
+  #    naive `tail -1`, restoring a months-old DB).
+  #  - awk '$3 > 1000000' drops empty/broken dumps (a failed mysqldump yields a ~20-byte
+  #    gzip; see the size guard in scripts/mysql-dump.sh).
+  #  - sort -k1,2 orders by the object's upload date+time so tail -1 is the newest good one.
   echo -n "looking for the last mysql backup in S3..."
-  HOME="/home/$(logname)" backup_filepath=$(/usr/local/bin/aws \
-    --endpoint-url=https://storage.yandexcloud.net \
+  backup_filepath=$(HOME="${deploy_home}" /usr/local/bin/aws ${restore_aws_profile:+--profile "${restore_aws_profile}"} \
+    --endpoint-url="${restore_s3_endpoint}" \
     --recursive \
     s3 ls "s3://${backup_s3_directory}/mysql_${mysql_restore_hostname}/" |
-    grep .gz |
+    grep -E "/[0-9]{4}-[0-9]{2}-[0-9]{2}/.*-mysqldump\.sql\.gz$" |
+    awk '$3 > 1000000' |
+    sort -k1,2 |
     tail -1 |
     cut -d '/' -f 2-)
+  [ -n "${backup_filepath}" ] || { echo " no valid (>1MB, dated) mysql dump found in S3!" && exit 48; }
   echo " found s3://${backup_s3_directory}/mysql_${mysql_restore_hostname}/${backup_filepath}"
   backup_dir=$(echo "${backup_filepath}" | cut -d "/" -f -1)
   if [ ! -f "${backup_directory_path}${backup_filepath}" ]; then
-    HOME="/home/$(logname)" /usr/local/bin/aws \
-      --endpoint-url=https://storage.yandexcloud.net \
+    HOME="${deploy_home}" /usr/local/bin/aws ${restore_aws_profile:+--profile "${restore_aws_profile}"} \
+      --endpoint-url="${restore_s3_endpoint}" \
       s3 cp \
       "s3://${backup_s3_directory}/mysql_${mysql_restore_hostname}/${backup_filepath}" \
       "${backup_directory_path}${backup_dir}/" >/dev/null
@@ -233,14 +494,30 @@ restore_mysql() {
 
   # create temp file to store mysql login and password for the time of the script
   # location for it should be the directory which is passed inside the container
-  apt-get -y install m4 >/dev/null
   mysql_config_file=$(
     echo 'mkstemp(template)' |
       m4 -D template="./private/mysql-data/deleteme_XXXXXX"
   ) || exit
 
   mysql_config_inside_container="/var/lib/mysql/${mysql_config_file##*/}"
-  echo "[client]\nuser = root\npassword = ${MYSQL_ROOT_PASSWORD}" >"${mysql_config_file}"
+  echo "[client]\nuser = root\npassword = ${MYSQL_ROOT_PASSWORD}\ndefault-character-set = utf8mb4" >"${mysql_config_file}"
+  trap 'rm -f -- "${mysql_config_file}"' EXIT
+
+  # start_services() returns as soon as `up -d` exits, but MySQL needs time to initialise.
+  # On an empty data directory the image's entrypoint first runs a temporary server on the
+  # same socket, where root has no password at first, and replaces itself with the real
+  # mysqld (exec) only when it is done. Wait until process 1 of the container is mysqld and
+  # the root login the import uses succeeds; otherwise the import fails with ERROR 2002 or
+  # 1045, or loses the temporary server mid-stream, and set -e aborts the whole restore.
+  echo -n "waiting for MySQL to accept the root login..."
+  wait_i=0
+  until mysql_ready; do
+    wait_i=$((wait_i + 1))
+    if [ "${wait_i}" -gt 100 ]; then echo " timeout after 300s" && exit 50; fi
+    sleep 3
+  done
+  echo " ready"
+
   prod_db_tables=$(
     docker exec -u0 mysql /bin/mysql \
       --defaults-extra-file="${mysql_config_inside_container}" \
@@ -253,19 +530,32 @@ restore_mysql() {
     return
   fi
   echo "restoring the MySQL backup..."
-  zcat "${backup_directory_path}${backup_filepath}" |
-    docker exec -u0 -i mysql /bin/mysql --defaults-extra-file="${mysql_config_inside_container}" "${mysql_restore_db}"
+  # The archive is checked before the import, and the import runs under bash with
+  # pipefail (sh has none): without it a zcat that dies mid-stream leaves mysql to
+  # load the prefix and exit 0, and a partial database would be reported as restored.
+  gzip -t "${backup_directory_path}${backup_filepath}"
+  bash -o pipefail -c 'zcat "$1" | docker exec -u0 -i mysql /bin/mysql --defaults-extra-file="$2" "$3"' \
+    restore-mysql "${backup_directory_path}${backup_filepath}" "${mysql_config_inside_container}" "${mysql_restore_db}"
   rm -f "${mysql_config_file}"
   echo "MySQL backup is restored"
 }
 
 start_services() {
+  # The production overlay makes nginx depend on the profile-gated updater (profile hooks),
+  # so a bare `docker compose <cmd>` errors at project load with
+  # "service nginx depends on undefined service updater". Default to the full prod set;
+  # an operator can override BEFORE running (e.g. a rehearsal that must not touch the live
+  # DNS zone or Zabbix exports COMPOSE_PROFILES=hooks to skip certs+monitoring).
+  # FTP is deliberately excluded and is started only through its manual profile.
+  : "${COMPOSE_PROFILES:=certs,monitoring,hooks}"
+  export COMPOSE_PROFILES
+  echo "starting services with COMPOSE_PROFILES=${COMPOSE_PROFILES}"
   echo "pulling docker images..."
-  docker-compose pull >/dev/null 2>&1 || true
+  docker compose pull >/dev/null 2>&1 || true
   echo "building docker images..."
-  docker-compose build >/dev/null 2>&1 || true
+  docker compose build >/dev/null 2>&1 || true
   echo "starting services..."
-  docker-compose up -d
+  docker compose up -d
   echo "docker setup is complete"
 }
 
@@ -279,13 +569,33 @@ and run 'docker-compose up -d' to prevent having two hosts sending data to same 
   fi
 }
 
+wait_for_apt_lock() {
+  # Fresh Ubuntu cloud images run unattended-upgrades at boot, which holds the dpkg lock
+  # for ~1-2 min. Without waiting, the first apt-get install (docker) fails and aborts the
+  # whole unattended run. Poll until the lock clears (cap 5 min). No-op if fuser is absent.
+  command -v fuser >/dev/null 2>&1 || return 0
+  i=0
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    [ "${i}" -eq 0 ] && echo -n "waiting for dpkg lock (unattended-upgrades) to clear..."
+    i=$((i + 1))
+    if [ "${i}" -gt 60 ]; then echo " timeout after 300s" && exit 51; fi
+    sleep 5
+  done
+  [ "${i}" -ne 0 ] && echo " cleared"
+  return 0
+}
+
 ### Main script logic
 
 # Pre-setup
+wait_for_apt_lock
+install_host_packages
 set_mtu_1450_if_not_set
 install_docker_if_not_installed
 install_docker_compose_if_not_installed
+admin_user_setup
 zabbix_setup
+zabbix_docker_acl_dropin
 set_up_duplicity
 setup_aws
 memcached_user_setup
@@ -293,11 +603,18 @@ mysql_user_setup
 
 # Backup restoration
 backup_restore
+deploy_user_check
+nested_repos_setup
+./scripts/fix-rights.sh
+private_hook pre-start
 start_services
 restore_mysql
+private_hook post-db
 create_host_cronjob_if_not_exist
+updater_access_setup
 
 # Final recommendations
 echo "\n\n=== Recommendations ==="
 final_ip_check
+check_second_backup_destination
 check_zabbix_hostname
